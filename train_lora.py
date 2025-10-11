@@ -184,7 +184,13 @@ class LengthAwareTrainer(Trainer):
         inputs.pop("completion_lengths", None)
         return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
-    def compute_loss(self, model, inputs, return_outputs=False):
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch: int | None = None,
+    ):
         completion_lengths = inputs.pop("completion_lengths", None)
         labels = inputs.pop("labels")
         outputs = model(**inputs, labels=labels)
