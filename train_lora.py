@@ -111,6 +111,7 @@ class PromptCompletionCollator:
 
     def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         input_ids, attn, labels = [], [], []
+        completion_lengths = []
 
         for ex in batch:
             prompt = ex["prompt"]
@@ -131,6 +132,7 @@ class PromptCompletionCollator:
             input_ids.append(ids)
             attn.append(mask)
             labels.append(lbl)
+            completion_lengths.append(sum(1 for tok in lbl if tok != -100))
 
         # 动态 padding 到当前 batch 的最长长度
         maxlen = max(len(x) for x in input_ids)
@@ -145,7 +147,77 @@ class PromptCompletionCollator:
             "input_ids": torch.tensor(input_ids, dtype=torch.long),
             "attention_mask": torch.tensor(attn, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
+            "completion_lengths": torch.tensor(completion_lengths, dtype=torch.float),
         }
+
+
+class LengthAwareTrainer(Trainer):
+    def __init__(self, *args, length_prior: float = 1.0,
+                 repeat_penalty_weight: float = 0.0,
+                 repeat_penalty_ngram: int = 4, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.length_prior = max(length_prior, 0.0)
+        self.repeat_penalty_weight = max(repeat_penalty_weight, 0.0)
+        self.repeat_penalty_ngram = max(repeat_penalty_ngram, 2)
+
+    @staticmethod
+    def _count_repeated_ngrams(labels: torch.Tensor, n: int) -> torch.Tensor:
+        counts = []
+        for row in labels:
+            toks = [int(t) for t in row.tolist() if t != -100]
+            if len(toks) < n:
+                counts.append(0.0)
+                continue
+            seen = set()
+            repeated = 0
+            for i in range(len(toks) - n + 1):
+                ng = tuple(toks[i : i + n])
+                if ng in seen:
+                    repeated += 1
+                else:
+                    seen.add(ng)
+            counts.append(float(repeated))
+        return torch.tensor(counts, device=labels.device, dtype=torch.float)
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = inputs.copy()
+        inputs.pop("completion_lengths", None)
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        completion_lengths = inputs.pop("completion_lengths", None)
+        labels = inputs.pop("labels")
+        outputs = model(**inputs, labels=labels)
+        logits = outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
+
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
+        token_losses = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+        ).view(labels.size(0), -1)
+
+        mask = (shift_labels != -100).float()
+        per_sample_loss = (token_losses * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+
+        if completion_lengths is not None:
+            weights = completion_lengths.to(per_sample_loss.device)
+            weights = weights.clamp_min(1.0)
+            if self.length_prior and self.length_prior != 1.0:
+                weights = torch.pow(weights, self.length_prior)
+            weights = weights / weights.mean().clamp_min(1e-6)
+        else:
+            weights = torch.ones_like(per_sample_loss)
+
+        loss = (per_sample_loss * weights).mean()
+
+        if self.repeat_penalty_weight > 0:
+            repeats = self._count_repeated_ngrams(labels, self.repeat_penalty_ngram)
+            if repeats.numel():
+                loss = loss + self.repeat_penalty_weight * repeats.mean()
+
+        return (loss, outputs) if return_outputs else loss
 
 # ---------------- Data ----------------
 def load_data(data_dir: Path):
@@ -161,10 +233,16 @@ def parse_args():
     p.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME)
     p.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
     p.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
-    p.add_argument("--num-epochs", type=float, default=2.0)
+    p.add_argument("--num-epochs", type=float, default=3.0)
     p.add_argument("--logging-steps", type=int, default=10)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--lr", type=float, default=5e-5)
     p.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
+    p.add_argument("--length-prior", type=float, default=1.15,
+                   help="completion 越长权重越高的指数（=1 表示不加权）")
+    p.add_argument("--repeat-penalty", type=float, default=0.03,
+                   help="对训练样本中重复 n-gram 的额外惩罚权重")
+    p.add_argument("--repeat-ngram", type=int, default=4,
+                   help="重复惩罚所检查的 n-gram 长度")
     return p.parse_args()
 
 def main():
@@ -200,13 +278,16 @@ def main():
         report_to=[],
     )
 
-    trainer = Trainer(
+    trainer = LengthAwareTrainer(
         model=model,
         tokenizer=tok,  # FutureWarning 可忽略；或改用 processing_class
         args=train_args,
         train_dataset=ds["train"],
         eval_dataset=ds.get("validation"),
         data_collator=collator,
+        length_prior=args.length_prior,
+        repeat_penalty_weight=args.repeat_penalty,
+        repeat_penalty_ngram=args.repeat_ngram,
     )
 
     trainer.train()

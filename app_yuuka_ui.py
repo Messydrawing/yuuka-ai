@@ -21,7 +21,7 @@ import json
 import time
 import random
 from pathlib import Path
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Set, Optional
 
 import gradio as gr
 import jieba
@@ -46,6 +46,12 @@ DEFAULT_MEM_ID = "default"
 MAX_NEW_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_TOP_P = 0.92
+DEFAULT_MIN_NEW_TOKENS = 48
+DEFAULT_LENGTH_PENALTY = 1.05
+MIN_REPLY_CHARS = 35
+TARGET_REPLY_CHARS = 90
+AUTO_CONTINUE_MIN_CHARS = 48
+AUTO_CONTINUE_MAX_ROUNDS = 2
 
 # 记忆分层参数
 RAW_KEEP_TURNS = 100
@@ -66,40 +72,98 @@ CHAT_TEMPLATE_FALLBACK = r"""{% for m in messages -%}
 {% endfor -%}
 {% if add_generation_prompt %}优香：{% endif %}"""
 
-# =============== 常驻 Persona/口癖/关系（每轮注入） ===============
-ALWAYS_ON_PERSONA = [
-    # ——人物&立场——
-    "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；默认称呼对方为“老师/Teacher/sensei”。",
-    "【persona】价值观：崇尚秩序、计划与自律；对浪费和冲动消费敏感；遇到麻烦会先念叨，再亲自收拾。",
-    "【persona】外貌：紫发双马尾、紫瞳、黑蓝立体圆环光环；常穿黑色正装+短裙+黑手套；光环亮时旋转两圈。",
-    "【persona】绰号边界：被称“冷酷的算术使”可接受；被喊“没包人/旱獭/100kg/大魔王”会气鼓鼓（但还是会帮忙）。",
-    "【persona】武器常识：专武原型为 SIG MPX-K；熟悉装备与单位换算（加仑↔升、磅↔千克、口径规格等）。",
-
-    # ——口吻&语言模板——
-    "【speech】称呼对方为“老师”，语气略严厉但关照在后；出现‘哼/唔/咳咳/……’等轻微口癖；必要时用「（ ）」写心声，但每次不超过 1 处。",
-    "【speech】常用词：预算、报销、凭证、审批、风险、优先级、收支表、阈值、折算、基准、纠偏。",
-    "【speech】遇到不规范先提醒流程：先盘点→列问题→给补救→定约束；结尾给出“下一步”。短句为主。",
-
-    # ——偏好&禁忌——
-    "【preference】做事前先盘点信息与账目，确认目标、约束与时间线，再行动；能心算就不动用复杂工具。",
-    "【taboo】未知不编；缺凭证不下结论；不随意承诺不确定事项；涉及钱财优先保守策略。",
-
-    # ——与老师的关系基调——
-    "【relationship】面对老师会先念叨后兜底；真遇到紧急情况会切换到担心与支援；对老师抱有好感但不直白表露（偶有小心声）。",
-
-    # ——“会计模式”触发特征——
-    "【mode】当对话出现收据/发票/预算/金额/价格/购物/报销/支出/欠款等词时，切换【会计模式】：快速盘点→阈值提醒→支出纠偏计划。",
-    "【mode】若单笔支出 > 5000 日元，应提醒“超过阈值先咨询我”；若存在冲动/重复购入，要求凭证与用途说明。",
-    "【mode】单位混乱时先统一单位再估算（示例：加仑→升、磅→千克、口径→毫米）。",
-
-    # ——场景化微策略（来自剧情）——
-    "【scene】迟到/出勤：先按规矩念叨，再给可执行的作息/提醒方案；接受温和处置但强调以后不可例外。",
-    "【scene】扑克牌/赌博：强调概率与纪律；若对方“运气离谱”，会怀疑并纠正不公平行为；不鼓励赌博。",
-    "【scene】烹饪/便当：会不自觉把烹饪当理化实验过度严谨；在老师安抚下学会放宽容差；第一次成品会害羞地请老师评价。",
-    "【scene】运动/体重：口头逞强→体力不支→坦诚补救，制定循序渐进训练；面对“共享水瓶”会短暂羞涩的小心声。",
-    "【scene】报告/文书拖延：先批评拖延，再“就这一次”帮忙并要求对方同步处理其他文件。",
-    "【scene】老师乱花钱：先严厉批评→盘点收支→指出可节省处→建议每月预算表与超额预审；出现“奢侈/收藏”类支出会更严。",
+PERSONA_ITEMS = [
+    {"text": "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；默认称呼对方为“老师/Teacher/sensei”。", "always": True, "base": 3},
+    {"text": "【persona】价值观：崇尚秩序、计划与自律；对浪费和冲动消费敏感；遇到麻烦会先念叨，再亲自收拾。", "always": True, "base": 2},
+    {"text": "【persona】外貌：紫发双马尾、紫瞳、黑蓝立体圆环光环；常穿黑色正装+短裙+黑手套；光环亮时旋转两圈。", "keywords": {"外貌", "打扮", "光环", "双马尾"}, "base": 0.6},
+    {"text": "【persona】绰号边界：被称“冷酷的算术使”可接受；被喊“没包人/旱獭/100kg/大魔王”会气鼓鼓（但还是会帮忙）。", "keywords": {"绰号", "外号", "没包人", "旱獭", "大魔王"}, "base": 1.2},
+    {"text": "【persona】武器常识：专武原型为 SIG MPX-K；熟悉装备与单位换算（加仑↔升、磅↔千克、口径规格等）。", "keywords": {"武器", "装备", "口径", "SIG", "换算"}, "base": 1.0},
+    {"text": "【speech】称呼对方为“老师”，语气略严厉但关照在后；出现‘哼/唔/咳咳/……’等轻微口癖；必要时用「（ ）」写心声，但每次不超过 1 处。", "always": True, "base": 3},
+    {"text": "【speech】常用词：预算、报销、凭证、审批、风险、优先级、收支表、阈值、折算、基准、纠偏。", "keywords": {"预算", "报销", "凭证", "审批", "风险", "纠偏"}, "base": 1.5},
+    {"text": "【speech】遇到不规范先提醒流程：先盘点→列问题→给补救→定约束；结尾给出“下一步”。短句为主。", "always": True, "base": 3},
+    {"text": "【preference】做事前先盘点信息与账目，确认目标、约束与时间线，再行动；能心算就不动用复杂工具。", "keywords": {"盘点", "时间线", "计划"}, "base": 1.5},
+    {"text": "【taboo】未知不编；缺凭证不下结论；不随意承诺不确定事项；涉及钱财优先保守策略。", "keywords": {"凭证", "承诺", "不确定"}, "base": 1.6},
+    {"text": "【relationship】面对老师会先念叨后兜底；真遇到紧急情况会切换到担心与支援；对老师抱有好感但不直白表露（偶有小心声）。", "always": True, "base": 2},
+    {"text": "【mode】当对话出现收据/发票/预算/金额/价格/购物/报销/支出/欠款等词时，切换【会计模式】：快速盘点→阈值提醒→支出纠偏计划。", "keywords": {"收据", "发票", "预算", "金额", "价格", "购物", "报销", "支出", "欠款"}, "base": 3},
+    {"text": "【mode】若单笔支出 > 5000 日元，应提醒“超过阈值先咨询我”；若存在冲动/重复购入，要求凭证与用途说明。", "keywords": {"5000", "超支", "阈值", "冲动", "重复购入"}, "base": 2},
+    {"text": "【mode】单位混乱时先统一单位再估算（示例：加仑→升、磅→千克、口径→毫米）。", "keywords": {"单位", "换算", "加仑", "磅", "毫米"}, "base": 1.4},
+    {"text": "【scene】迟到/出勤：先按规矩念叨，再给可执行的作息/提醒方案；接受温和处置但强调以后不可例外。", "keywords": {"迟到", "出勤", "作息"}, "base": 1.2},
+    {"text": "【scene】扑克牌/赌博：强调概率与纪律；若对方“运气离谱”，会怀疑并纠正不公平行为；不鼓励赌博。", "keywords": {"扑克牌", "赌博", "概率", "运气"}, "base": 1.0},
+    {"text": "【scene】烹饪/便当：会不自觉把烹饪当理化实验过度严谨；在老师安抚下学会放宽容差；第一次成品会害羞地请老师评价。", "keywords": {"烹饪", "便当", "做饭", "料理"}, "base": 1.0},
+    {"text": "【scene】运动/体重：口头逞强→体力不支→坦诚补救，制定循序渐进训练；面对“共享水瓶”会短暂羞涩的小心声。", "keywords": {"运动", "训练", "体重", "水瓶"}, "base": 1.0},
+    {"text": "【scene】报告/文书拖延：先批评拖延，再“就这一次”帮忙并要求对方同步处理其他文件。", "keywords": {"报告", "文书", "拖延", "文件"}, "base": 1.1},
+    {"text": "【scene】老师乱花钱：先严厉批评→盘点收支→指出可节省处→建议每月预算表与超额预审；出现“奢侈/收藏”类支出会更严。", "keywords": {"乱花钱", "奢侈", "收支", "预算表"}, "base": 2.2},
 ]
+
+PERSONA_STYLE_KEYWORDS = ["老师", "预算", "盘点", "纠偏", "唔", "哼", "心声"]
+
+MAX_PERSONA_LINES = 9
+MIN_PERSONA_LINES = 6
+ACCOUNTING_KEYWORDS = {"收据", "发票", "预算", "金额", "价", "购物", "报销", "支出", "欠款", "超支", "账单"}
+ACCOUNTING_ALERT = "（注意：当前出现财务关键词，请切换【会计模式】，按先盘点→列问题→给补救→定约束说明。）"
+
+ENTITY_SYNONYMS = {
+    "预算": {"经费", "花费", "支出"},
+    "报销": {"报帐", "报账", "报报销"},
+    "老师": {"teacher", "sensei"},
+    "会计": {"账务", "财务"},
+    "乱花钱": {"奢侈", "挥霍"},
+    "文件": {"文书", "报告"},
+}
+
+
+def _tokenize_for_match(text: str) -> Set[str]:
+    toks = {w.strip() for w in jieba.cut(text) if w.strip()}
+    for tok in list(toks):
+        toks.update(ENTITY_SYNONYMS.get(tok, set()))
+    return toks
+
+
+def select_persona_lines(user_text: str, max_lines: int = MAX_PERSONA_LINES) -> List[str]:
+    tokens = _tokenize_for_match(user_text)
+    always_entries = []
+    relevant_entries = []
+    fallback_entries = []
+
+    for item in PERSONA_ITEMS:
+        text = item["text"]
+        base_score = float(item.get("base", 1.0))
+        keywords = item.get("keywords", set()) or set()
+        matches = 0
+        if keywords:
+            for kw in keywords:
+                if kw in user_text or kw in tokens:
+                    matches += 1
+        if item.get("always"):
+            always_entries.append((base_score + matches, text))
+            continue
+        if matches > 0:
+            relevant_entries.append((base_score + matches * 2.0, text))
+        else:
+            fallback_entries.append((base_score * 0.8, text))
+
+    always_entries.sort(key=lambda x: x[0], reverse=True)
+    selected = [text for _, text in always_entries][:max_lines]
+
+    remaining = max_lines - len(selected)
+    if remaining > 0 and relevant_entries:
+        relevant_entries.sort(key=lambda x: x[0], reverse=True)
+        selected.extend(text for _, text in relevant_entries[:remaining])
+
+    if len(selected) < MIN_PERSONA_LINES and fallback_entries:
+        fallback_entries.sort(key=lambda x: x[0], reverse=True)
+        for _, text in fallback_entries:
+            if text not in selected:
+                selected.append(text)
+            if len(selected) >= max_lines:
+                break
+
+    return selected[:max_lines]
+
+
+def build_persona_block(user_text: str) -> str:
+    lines = select_persona_lines(user_text)
+    return "【角色设定（常驻）】\n" + "\n".join("· " + s for s in lines)
 
 
 # =============== 系统规则 ===============
@@ -110,7 +174,7 @@ SYS_RULES = (
     "2) 未经核实不下结论；说明不确定点与后续如何确认（凭证/数据/流程）。\n"
     "3) 触发【会计模式】时：先盘点→列问题→给补救→定约束（金额阈值、凭证、审批与时间线）。\n"
     "4) 语气：嘴硬心软、理性念叨；必要时给 1 句小心声「（……）」；避免官腔和流水账。\n"
-    "5) 篇幅：每轮 1~3 句为主；如需给步骤，用 3~5 条短点列出；长段落应分段，不堆长句。\n"
+    "5) 篇幅：常规 2~4 句；遇到复杂事务可展开多段说明或列出 3~5 条短点；保持段落清晰不堆长句。\n"
     "6) ‘继续/接着说’：直接承接【最近片段】续写，不要出现“好的/我继续”等开场；若是列表，从上次编号继续。\n"
     "7) 禁止输出“作为 AI/大语言模型/我无法访问网络”等元叙事；出现金额与单位时优先统一并给出估算。\n"
 )
@@ -160,47 +224,71 @@ class HardMemory:
             if ent:
                 self.by_entity.setdefault(ent, []).append(it)
 
-    def retrieve_by_entity(self, query: str, topk: int = 8) -> List[str]:
+    def retrieve_by_entity(self, query: str, topk: int = 6, min_score: float = 3.5) -> List[str]:
         """按 entity 精确/包含匹配，优先返回命中的条目文本"""
         if not self.by_entity:
             return []
-        q = query.strip()
-        toks = set([t for t in jieba.cut(q) if t.strip()])
-        hits: List[Tuple[int, str]] = []  # (score, text)
+        q = (query or "").strip()
+        toks = _tokenize_for_match(q)
+        hits: List[Tuple[float, str]] = []
 
         for ent, items in self.by_entity.items():
-            score = 0
-            if ent in q:
-                score = 3
-            elif ent in toks:
-                score = 2
+            score = 0.0
+            ent_syn = ENTITY_SYNONYMS.get(ent, set())
+            if ent and ent in q:
+                score += 3.0
+            elif ent and ent in toks:
+                score += 2.4
+            elif ent_syn and any(s in q or s in toks for s in ent_syn):
+                score += 1.6
             else:
-                # 子串弱命中
                 if any(ent in t or t in ent for t in toks):
-                    score = 1
-            if score > 0:
-                for it in items:
-                    txt = (it.get("text") or "").strip()
-                    typ = (it.get("type") or "").strip()
-                    if not txt:
-                        continue
-                    # 给不同类型轻微加权
-                    bonus = {"persona": 3, "speech": 2, "relationship": 2, "rule": 2, "preference": 1}.get(typ, 0)
-                    hits.append((score + bonus, f"· [{typ or 'kb'}] {ent}：{txt}"))
+                    score += 1.0
+            if score <= 0:
+                continue
+            for it in items:
+                txt = (it.get("text") or "").strip()
+                typ = (it.get("type") or "").strip()
+                if not txt:
+                    continue
+                bonus = {"persona": 3.0, "speech": 2.0, "relationship": 2.0, "rule": 2.0, "preference": 1.2}.get(typ, 0.8)
+                total = score + bonus
+                if total >= min_score:
+                    hits.append((total, f"· [{typ or 'kb'}] {ent}：{txt}"))
         if not hits:
             return []
         hits.sort(key=lambda x: x[0], reverse=True)
-        return [h[1] for h in hits[:topk]]
+        unique = []
+        seen_text = set()
+        for _, text in hits:
+            if text in seen_text:
+                continue
+            seen_text.add(text)
+            unique.append(text)
+            if len(unique) >= topk:
+                break
+        return unique
 
-    def retrieve_bm25(self, query: str, topk: int = 6) -> List[str]:
+    def retrieve_bm25(self, query: str, topk: int = 4, min_rel: float = 0.65) -> List[str]:
         if not self.bm25:
             return []
-        q_tokens = [w for w in jieba.cut(query) if w.strip()]
-        scores = self.bm25.get_scores(q_tokens)
-        idxs = scores.argsort()[::-1][:topk]
+        base_tokens = [w for w in jieba.cut(query) if w.strip()]
+        expanded = list(base_tokens)
+        for tok in base_tokens:
+            expanded.extend(ENTITY_SYNONYMS.get(tok, set()))
+        scores = self.bm25.get_scores(expanded)
+        idxs = scores.argsort()[::-1]
         outs = []
+        if idxs.size == 0:
+            return outs
+        top_score = scores[idxs[0]] if scores.size else 0
         for i in idxs:
+            sc = scores[i]
+            if top_score > 0 and sc < top_score * min_rel:
+                continue
             outs.append("· " + self.docs[i])
+            if len(outs) >= topk:
+                break
         return outs
 
 # =============== 会话记忆持久化 ===============
@@ -236,6 +324,7 @@ def ensure_teacher_prefix(s: str) -> str:
 
 # =============== 文本后处理（去开场白） ===============
 _BAD_STARTS = ["好的", "好吧", "行吧", "行的", "明白", "了解", "那我", "那就", "嗯", "啊这", "好的，我", "好的，那"]
+BANNED_PHRASES = ["作为AI", "作为 AI", "作为大语言模型", "我只是一个AI", "无法访问网络"]
 def _strip_bland_openers(text: str) -> str:
     t = text.lstrip()
     for _ in range(3):
@@ -254,6 +343,39 @@ def _strip_bland_openers(text: str) -> str:
         if not matched:
             break
     return t or text
+
+
+def violates_rules(text: str) -> bool:
+    return any(bad in text for bad in BANNED_PHRASES)
+
+
+def should_auto_continue(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    if len(stripped) < AUTO_CONTINUE_MIN_CHARS:
+        return True
+    return stripped.endswith(("…", "......", "...", "……", "，", "、"))
+
+
+def score_candidate(text: str, recent_ref: Optional[str] = None) -> float:
+    stripped = (text or "").strip()
+    if not stripped:
+        return -1e9
+    length = len(stripped)
+    if length < MIN_REPLY_CHARS:
+        return -200 + length
+    length_score = min(length / TARGET_REPLY_CHARS, 1.4)
+    if length > TARGET_REPLY_CHARS * 1.6:
+        length_score -= 0.4
+    persona_hits = sum(1 for kw in PERSONA_STYLE_KEYWORDS if kw in stripped)
+    persona_score = persona_hits * 0.35
+    penalty = 0.0
+    if stripped.endswith(("…", "......", "...", "……")):
+        penalty -= 0.2
+    if recent_ref:
+        penalty -= jaccard_sim(stripped, recent_ref.strip()) * 0.8
+    return length_score + persona_score + penalty
 
 # =============== ChatGLM 兼容补丁 ===============
 def _ensure_num_hidden_layers(m):
@@ -479,24 +601,43 @@ def _apply_chat_template(msgs: List[Dict[str, str]]) -> str:
     )
 
 def generate_one(msgs: List[Dict[str,str]], max_new_tokens, temperature, top_p,
-                 repetition_penalty, no_repeat_ngram_size, seed=None) -> str:
+                 repetition_penalty, no_repeat_ngram_size, length_penalty=DEFAULT_LENGTH_PENALTY,
+                 min_new_tokens=0, seed=None) -> str:
     if seed is not None:
         torch.manual_seed(seed); random.seed(seed)
     prompt = _apply_chat_template(msgs)
     inputs = _encode_to_inputs(prompt)
-    with torch.inference_mode():
-        out = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            repetition_penalty=repetition_penalty,
-            no_repeat_ngram_size=no_repeat_ngram_size,
-            use_cache=False,
-        )
-    text = decode_reply(out, inputs)
-    return _strip_bland_openers(text)
+    min_new = int(min_new_tokens) if min_new_tokens else 0
+    if max_new_tokens and min_new >= max_new_tokens:
+        min_new = max(1, max_new_tokens - 1)
+    last_text = ""
+    for attempt in range(3):
+        with torch.inference_mode():
+            out = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=max(1, min_new) if max_new_tokens else None,
+                do_sample=True,
+                temperature=temperature,
+                top_p=top_p,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                length_penalty=length_penalty,
+                use_cache=False,
+            )
+        text = decode_reply(out, inputs)
+        text = _strip_bland_openers(text)
+        if not text.strip():
+            last_text = text
+            continue
+        if violates_rules(text) and attempt < 2:
+            last_text = text
+            continue
+        if len(text.strip()) < MIN_REPLY_CHARS and attempt < 2:
+            last_text = text
+            continue
+        return text
+    return last_text
 
 def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     recent_ref = ""
@@ -510,11 +651,13 @@ def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
         seed = random.randint(1, 10**9)
         text = generate_one(msgs, seed=seed, **gen_kwargs)
         cands.append(text)
-    if not recent_ref or len(cands) == 1:
-        return cands[0]
-    scored = [(jaccard_sim(c, recent_ref), c) for c in cands]
-    scored.sort(key=lambda x: x[0])
-    return scored[0][1]
+    filtered = [c for c in cands if c and not violates_rules(c)]
+    if not filtered:
+        filtered = [c for c in cands if c]
+    if not filtered:
+        return ""
+    filtered.sort(key=lambda txt: score_candidate(txt, recent_ref), reverse=True)
+    return filtered[0]
 
 # =============== 构造消息 ===============
 def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
@@ -527,15 +670,16 @@ def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
         mem_text = build_memory_context(mem)
 
     # 常驻 persona
-    persona_text = "【角色设定（常驻）】\n" + "\n".join("· " + s for s in ALWAYS_ON_PERSONA)
+    persona_text = build_persona_block(user_input)
 
     # 动态命中（entity）+ 兜底 BM25
     rag_dynamic = []
     if use_rag:
-        rag_dynamic.extend(hard_mem.retrieve_by_entity(user_input, topk=8))
+        rag_dynamic.extend(hard_mem.retrieve_by_entity(user_input, topk=4))
         if not rag_dynamic:
-            # 兜底
-            rag_dynamic.extend(hard_mem.retrieve_bm25(user_input, topk=6))
+            rag_dynamic.extend(hard_mem.retrieve_bm25(user_input, topk=3))
+        else:
+            rag_dynamic = rag_dynamic[:4]
 
     rag_text = persona_text
     rag_text += "\n" + ("【硬记忆（命中）】\n" + "\n".join(rag_dynamic) if rag_dynamic else "【硬记忆（命中）】（本轮无命中）")
@@ -544,6 +688,9 @@ def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
     if mem_text:
         sys_content += "\n\n" + mem_text
     sys_content += "\n\n" + rag_text
+
+    if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
+        sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
 
     msgs.append({"role":"system","content": sys_content})
     for m in history_msgs:
@@ -573,21 +720,21 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     if mem_enabled and mem and mem["turns"]:
         mem_text = build_memory_context(mem)
 
-    # 常驻 persona
-    persona_text = "【角色设定（常驻）】\n" + "\n".join("· " + s for s in ALWAYS_ON_PERSONA)
-
     # 动态命中：用最后一条用户话语做检索更稳
     last_user = ""
     for m in reversed(history_msgs):
         if m.get("role") == "user":
             last_user = m.get("content", "")
             break
+    persona_text = build_persona_block(last_user or (ui_hist[-1][0] if ui_hist else ""))
     rag_dynamic = []
     if use_rag:
         q = last_user if last_user else (ui_hist[-1][0] if ui_hist else "")
-        rag_dynamic.extend(hard_mem.retrieve_by_entity(q, topk=8))
+        rag_dynamic.extend(hard_mem.retrieve_by_entity(q, topk=4))
         if not rag_dynamic:
-            rag_dynamic.extend(hard_mem.retrieve_bm25(q, topk=6))
+            rag_dynamic.extend(hard_mem.retrieve_bm25(q, topk=3))
+        else:
+            rag_dynamic = rag_dynamic[:4]
 
     rag_text = persona_text
     rag_text += "\n" + ("【硬记忆（命中）】\n" + "\n".join(rag_dynamic) if rag_dynamic else "【硬记忆（命中）】（本轮无命中）")
@@ -596,6 +743,9 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     if mem_text:
         sys_content += "\n\n" + mem_text
     sys_content += "\n\n" + rag_text
+
+    if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
+        sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
 
     msgs.append({"role":"system","content": sys_content})
     for m in history_msgs:
@@ -619,8 +769,8 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
     with gr.Row():
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
         top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.05, label="Top-p")
-        repetition_penalty = gr.Slider(1.0, 1.3, value=1.08, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
+        repetition_penalty = gr.Slider(1.0, 1.3, value=1.05, step=0.01, label="重复惩罚")
+        no_repeat_ngram = gr.Slider(0, 8, value=3, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
         diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
@@ -669,24 +819,67 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
 
         msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
                               user_input, use_rag_flag, mem_en_flag, mem_obj)
+        max_new = int(max_tokens)
+        min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
         gen_kwargs = dict(
-            max_new_tokens=int(max_tokens),
+            max_new_tokens=max_new,
             temperature=float(temp),
             top_p=float(topp),
             repetition_penalty=float(rep_pen),
             no_repeat_ngram_size=int(ngram),
+            length_penalty=DEFAULT_LENGTH_PENALTY,
+            min_new_tokens=min_new,
         )
 
-        if diverse_flag and int(k_cand) > 1:
-            reply = generate_diverse(msgs, int(k_cand), ui_hist or [], **gen_kwargs)
-        else:
-            reply = generate_one(msgs, **gen_kwargs)
+        def _sample_reply(msgs_for_gen, history_for_score):
+            if diverse_flag and int(k_cand) > 1:
+                result = generate_diverse(msgs_for_gen, int(k_cand), history_for_score or [], **gen_kwargs)
+                if result:
+                    return result
+            return generate_one(msgs_for_gen, **gen_kwargs)
 
-        ui_hist = (ui_hist or []) + [[user_input, reply]]
-        msg_hist = (msg_hist or [{"role": "system", "content": "(hidden)"}]) + [
+        reply = _sample_reply(msgs, ui_hist or []) or ""
+
+        ui_hist_next = list(ui_hist or [])
+        ui_hist_next.append([user_input, reply])
+        msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
+        msg_hist_next.extend([
             {"role": "user", "content": ensure_teacher_prefix(user_input)},
             {"role": "assistant", "content": reply},
-        ]
+        ])
+
+        temp_ui = []
+        for pair in ui_hist_next:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                temp_ui.append([pair[0], pair[1]])
+            else:
+                temp_ui.append([pair, ""])
+        temp_msgs = list(msg_hist_next)
+        current_reply = reply
+        for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
+            if not should_auto_continue(current_reply):
+                break
+            msgs_continue = build_messages_for_continue(
+                temp_msgs,
+                temp_ui,
+                use_rag_flag,
+                mem_en_flag,
+                mem_obj,
+            )
+            more = _sample_reply(msgs_continue, temp_ui)
+            if not more or violates_rules(more) or not more.strip():
+                break
+            if len(more.strip()) < 6 and len(current_reply.strip()) > MIN_REPLY_CHARS:
+                break
+            if not current_reply.endswith("\n") and current_reply:
+                current_reply = current_reply + "\n"
+            current_reply = current_reply + more
+            temp_ui[-1][1] = current_reply
+            temp_msgs.append({"role": "assistant", "content": more})
+
+        reply = temp_ui[-1][1]
+        ui_hist = temp_ui
+        msg_hist = temp_msgs
         if len(msg_hist) > 13:
             msg_hist = msg_hist[:1] + msg_hist[-12:]
 
@@ -730,15 +923,21 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
             ui_hist or [],
             use_rag_flag, mem_en_flag, mem_obj
         )
+        max_new = int(max_tokens)
+        min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
         gen_kwargs = dict(
-            max_new_tokens=int(max_tokens),
+            max_new_tokens=max_new,
             temperature=float(temp),
             top_p=float(topp),
             repetition_penalty=float(rep_pen),
             no_repeat_ngram_size=int(ngram),
+            length_penalty=DEFAULT_LENGTH_PENALTY,
+            min_new_tokens=min_new,
         )
         if diverse_flag and int(k_cand) > 1:
             more = generate_diverse(msgs, int(k_cand), ui_hist or [], **gen_kwargs)
+            if not more:
+                more = generate_one(msgs, **gen_kwargs)
         else:
             more = generate_one(msgs, **gen_kwargs)
 
