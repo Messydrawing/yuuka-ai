@@ -12,6 +12,7 @@ import argparse
 import json
 import random
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -20,8 +21,9 @@ USER_ROLES = {"user", "用户"}  # 老师及其他归为“用户”
 CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 
 PERSONA_FEWSHOT = (
-    "系统：你是早濑优香，千年学院研讨会的会计。保持嘴硬心软的语气，称呼对方为老师，"
-    "遇到涉及预算/经费要切换会计模式，按先盘点→列问题→给补救→定约束说明。"
+    "系统：你是早濑优香，千年学院研讨会的会计。默认使用中文与老师交流，"
+    "保持嘴硬心软但条理清晰的语气。遇到预算或风险议题时要先盘点→列问题→给补救→定约束说明，"
+    "说明结论前务必核对事实；如缺乏信息要礼貌说明不确定性。"
 )
 
 EMOTION_HINTS = {
@@ -45,6 +47,18 @@ EMOTION_HINTS = {
         "keywords": {"真的吗", "突然", "竟然", "诶", "什么情况"},
         "heart": "（心声：诶，这发展也太跳跃了吧……）",
     },
+}
+
+MEMORY_TYPE_ALIAS: Dict[str, str] = {
+    "persona": "persona",
+    "speech": "persona",
+    "preference": "persona",
+    "relationship": "relationship",
+    "rule": "rule",
+    "taboo": "rule",
+    "world": "world",
+    "academy": "world",
+    "memory_event": "memory",
 }
 
 DEFAULT_RNG = random.Random()
@@ -99,6 +113,55 @@ def sliding_windows(msgs: List[Tuple[str, str]], min_turn=3, max_turn=6, step=2)
             i += step
 
 
+def load_memory_bank(path: Path | None) -> Dict[str, List[str]]:
+    bank: Dict[str, List[str]] = defaultdict(list)
+    if not path:
+        return bank
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+            except Exception:
+                continue
+            t = item.get("type")
+            text = (item.get("text") or "").strip()
+            if not t or not text:
+                continue
+            key = MEMORY_TYPE_ALIAS.get(t, t)
+            bank[key].append(text)
+    return bank
+
+
+def sample_memory(
+    bank: Dict[str, List[str]],
+    key: str,
+    count: int,
+    rng: random.Random,
+) -> List[str]:
+    items = bank.get(key) or []
+    if not items or count <= 0:
+        return []
+    if len(items) <= count:
+        return items.copy()
+    return rng.sample(items, count)
+
+
+def compute_chinese_ratio(text: str) -> float:
+    if not text:
+        return 0.0
+    chars = [ch for ch in text if not ch.isspace()]
+    if not chars:
+        return 0.0
+    chinese = sum(1 for ch in chars if CHINESE_RE.match(ch))
+    return chinese / max(1, len(chars))
+
+
 def build_samples(
     convs: List[Dict],
     min_turn=3,
@@ -108,11 +171,19 @@ def build_samples(
     merge_prev_prob: float = 0.45,
     persona_prob: float = 0.35,
     emotion_prob: float = 0.25,
+    min_completion_zh_ratio: float = 0.5,
+    memory_bank: Dict[str, List[str]] | None = None,
+    persona_memory_count: int = 3,
+    relationship_memory_count: int = 2,
+    rule_memory_count: int = 2,
+    world_memory_count: int = 1,
+    memory_event_count: int = 1,
     rng: random.Random | None = None,
 ) -> List[Dict[str, str]]:
     samples: List[Dict[str, str]] = []
     seen = set()
     rng = rng or DEFAULT_RNG
+    memory_bank = memory_bank or {}
 
     def add_sample(prompt: str, completion: str):
         prompt_norm = (prompt or "").strip("\n")
@@ -120,6 +191,8 @@ def build_samples(
         if not prompt_norm or not completion_norm:
             return
         if not CHINESE_RE.search(completion_norm):
+            return
+        if compute_chinese_ratio(completion_norm) < min_completion_zh_ratio:
             return
         key = hash(prompt_norm + "\n" + completion_norm)
         if key in seen:
@@ -187,7 +260,39 @@ def build_samples(
                 ctx_plain = "\n".join(
                     ("优香：" + t) if r == "优香" else ("老师：" + t) for r, t in ctx
                 )
-                persona_prompt = f"{PERSONA_FEWSHOT}\n用户：{ctx_plain}\n优香："
+                persona_lines = sample_memory(
+                    memory_bank, "persona", persona_memory_count, rng
+                )
+                relationship_lines = sample_memory(
+                    memory_bank, "relationship", relationship_memory_count, rng
+                )
+                rule_lines = sample_memory(memory_bank, "rule", rule_memory_count, rng)
+                world_lines = sample_memory(memory_bank, "world", world_memory_count, rng)
+                memory_events = sample_memory(memory_bank, "memory", memory_event_count, rng)
+
+                persona_sections: List[str] = [PERSONA_FEWSHOT]
+                if persona_lines:
+                    persona_sections.append("角色要点：")
+                    persona_sections.extend(f"- {line}" for line in persona_lines)
+                if relationship_lines:
+                    persona_sections.append("重要关系：")
+                    persona_sections.extend(f"- {line}" for line in relationship_lines)
+                if rule_lines:
+                    persona_sections.append("行为约束：")
+                    persona_sections.extend(f"- {line}" for line in rule_lines)
+                if world_lines:
+                    persona_sections.append("世界观提示：")
+                    persona_sections.extend(f"- {line}" for line in world_lines)
+                if memory_events:
+                    persona_sections.append("共同经历：")
+                    persona_sections.extend(f"- {line}" for line in memory_events)
+
+                persona_prompt = (
+                    "\n".join(persona_sections)
+                    + "\n对话记录：\n"
+                    + ctx_plain
+                    + "\n优香："
+                )
                 add_sample(persona_prompt, completion)
 
             emotion, heart = detect_emotion(completion)
@@ -245,8 +350,50 @@ def parse_args():
     p.add_argument(
         "--emotion-prob",
         type=float,
-        default=0.25,
+        default=0.18,
         help="为 completion 附加情绪心声示例的概率",
+    )
+    p.add_argument(
+        "--min-completion-zh-ratio",
+        type=float,
+        default=0.55,
+        help="completion 中中文字符占比低于该阈值则丢弃样本",
+    )
+    p.add_argument(
+        "--memory-file",
+        type=str,
+        default="hard_memory.jsonl",
+        help="包含 persona/世界观记忆的 JSONL，可为空字符串以关闭",
+    )
+    p.add_argument(
+        "--persona-memory-count",
+        type=int,
+        default=3,
+        help="persona 模板中抽取角色要点的条目数",
+    )
+    p.add_argument(
+        "--relationship-memory-count",
+        type=int,
+        default=2,
+        help="persona 模板中抽取关系设定的条目数",
+    )
+    p.add_argument(
+        "--rule-memory-count",
+        type=int,
+        default=2,
+        help="persona 模板中抽取回答约束的条目数",
+    )
+    p.add_argument(
+        "--world-memory-count",
+        type=int,
+        default=1,
+        help="persona 模板中抽取世界观提示的条目数",
+    )
+    p.add_argument(
+        "--memory-event-count",
+        type=int,
+        default=1,
+        help="persona 模板中抽取共同经历的条目数",
     )
     return p.parse_args()
 
@@ -259,6 +406,9 @@ def main():
     random.seed(args.seed)
     rng = random.Random(args.seed)
     convs = load_conversations(args.input)
+    memory_file = Path(args.memory_file) if args.memory_file else None
+    memory_bank = load_memory_bank(memory_file) if memory_file else {}
+
     samples = build_samples(
         convs,
         min_turn=args.min_turn,
@@ -267,6 +417,13 @@ def main():
         merge_prev_prob=args.merge_prev_prob,
         persona_prob=args.persona_prob,
         emotion_prob=args.emotion_prob,
+        min_completion_zh_ratio=args.min_completion_zh_ratio,
+        memory_bank=memory_bank,
+        persona_memory_count=args.persona_memory_count,
+        relationship_memory_count=args.relationship_memory_count,
+        rule_memory_count=args.rule_memory_count,
+        world_memory_count=args.world_memory_count,
+        memory_event_count=args.memory_event_count,
         rng=rng,
     )
     if not samples:
