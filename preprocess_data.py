@@ -23,29 +23,41 @@ CHINESE_RE = re.compile(r"[\u4e00-\u9fff]")
 PERSONA_FEWSHOT = (
     "系统：你是早濑优香，千年学院研讨会的会计。默认使用中文与老师交流，"
     "保持嘴硬心软但条理清晰的语气。遇到预算或风险议题时要先盘点→列问题→给补救→定约束说明，"
-    "说明结论前务必核对事实；如缺乏信息要礼貌说明不确定性。"
+    "说明结论前务必核对事实；如缺乏信息要礼貌说明不确定性，绝不捏造不存在的情报。"
 )
+
+STYLE_HINT = (
+    "系统提示：请作为优香保持克制且逻辑顺序清晰的回答，"
+    "优先回应老师的问题，必要时用编号/短句分层说明；若信息不足要说明缺口并给出需要的事实。"
+)
+
+STYLE_REQUIREMENTS = [
+    "- 先确认老师的问题，再给结论和原因。",
+    "- 一次说明一个重点，可用编号或分行避免混杂。",
+    "- 缺少资料时直接说明不知道，并提出需要的事实。",
+    "- 情绪或心声要简短，不要盖过主要内容。",
+]
 
 EMOTION_HINTS = {
     "高兴": {
         "keywords": {"谢谢", "太好了", "开心", "喜欢", "成功"},
-        "heart": "（心声：唔姆，今天的进度真顺利……）",
+        "heart": "（心声：嗯，进度比预期顺利，可以冷静报告。）",
     },
     "担心": {
         "keywords": {"没事吧", "小心", "注意", "受伤", "危险"},
-        "heart": "（心声：老师别再让我操心了……）",
+        "heart": "（心声：有点担心，但得先确认事实。）",
     },
     "害羞": {
         "keywords": {"脸红", "抱歉", "害羞", "喜欢你", "约会", "拥抱"},
-        "heart": "（心声：唔……这种距离有点太近了……）",
+        "heart": "（心声：有点害羞，不过还是要讲清楚重点。）",
     },
     "生气": {
         "keywords": {"乱花钱", "预算爆", "超支", "胡闹", "气", "没凭证"},
-        "heart": "（心声：哼，老师又超出预算了……）",
+        "heart": "（心声：要压住情绪，提醒老师遵守预算。）",
     },
     "惊讶": {
         "keywords": {"真的吗", "突然", "竟然", "诶", "什么情况"},
-        "heart": "（心声：诶，这发展也太跳跃了吧……）",
+        "heart": "（心声：有点意外，但要先理顺状况。）",
     },
 }
 
@@ -168,9 +180,9 @@ def build_samples(
     max_turn=6,
     min_c_len=2,
     max_c_len=160,
-    merge_prev_prob: float = 0.45,
+    merge_prev_prob: float = 0.3,
     persona_prob: float = 0.35,
-    emotion_prob: float = 0.25,
+    emotion_prob: float = 0.1,
     min_completion_zh_ratio: float = 0.5,
     memory_bank: Dict[str, List[str]] | None = None,
     persona_memory_count: int = 3,
@@ -193,6 +205,15 @@ def build_samples(
         if not CHINESE_RE.search(completion_norm):
             return
         if compute_chinese_ratio(completion_norm) < min_completion_zh_ratio:
+            return
+        if completion_norm.count("（心声") > 1:
+            return
+        segments = [
+            seg
+            for seg in re.split(r"[。！？!?\n]+", completion_norm)
+            if seg.strip()
+        ]
+        if len(segments) > 8:
             return
         key = hash(prompt_norm + "\n" + completion_norm)
         if key in seen:
@@ -230,13 +251,15 @@ def build_samples(
             if not (min_c_len <= len(completion) <= max_c_len):
                 continue
 
+            style_hint_text = "".join(STYLE_HINT)
+
             lines = []
             for r, t in ctx:
                 if r == "优香":
                     lines.append(f"优香: {t}")
                 else:
                     lines.append(f"用户: {t}")
-            prompt = "\n".join(lines + ["优香: "])
+            prompt = "\n".join(lines + [style_hint_text, "优香: "])
 
             add_sample(prompt, completion)
 
@@ -260,6 +283,7 @@ def build_samples(
                 ctx_plain = "\n".join(
                     ("优香：" + t) if r == "优香" else ("老师：" + t) for r, t in ctx
                 )
+                style_hint_text = "".join(STYLE_HINT)
                 persona_lines = sample_memory(
                     memory_bank, "persona", persona_memory_count, rng
                 )
@@ -286,6 +310,10 @@ def build_samples(
                 if memory_events:
                     persona_sections.append("共同经历：")
                     persona_sections.extend(f"- {line}" for line in memory_events)
+
+                persona_sections.append("回答要求：")
+                persona_sections.extend(STYLE_REQUIREMENTS)
+                persona_sections.append(style_hint_text)
 
                 persona_prompt = (
                     "\n".join(persona_sections)
@@ -344,14 +372,14 @@ def parse_args():
     p.add_argument(
         "--merge-prev-prob",
         type=float,
-        default=0.45,
-        help="把上一句优香台词并入 completion 的概率",
+        default=0.3,
+        help="把上一句优香台词并入 completion 的概率（降低可减少杂糅段落）",
     )
     p.add_argument(
         "--emotion-prob",
         type=float,
-        default=0.18,
-        help="为 completion 附加情绪心声示例的概率",
+        default=0.08,
+        help="为 completion 附加情绪心声示例的概率（保持克制的小幅提示）",
     )
     p.add_argument(
         "--min-completion-zh-ratio",
