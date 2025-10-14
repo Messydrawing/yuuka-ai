@@ -42,10 +42,16 @@ python scripts/data_audit.py data/processed/train.jsonl
 python train_lora.py \
   --model-name models/chatglm3-6b \
   --data-dir data/processed \
-  --output-dir models/yuuka_glm_lora
+  --output-dir models/yuuka_glm_lora \
+  --persona-file docs/persona_yuuka.txt \
+  --persona-apply prompt \
+  --style-keywords "优香,老师,音乐" \
+  --style-boost 0.35
 ```
 
 - 默认使用 4bit QLoRA，batch=1、grad_accum=16，适合 8GB 显存。
+- `--persona-prefix/--persona-file` 可在 prompt 或 completion 前附加角色设定，`--persona-apply` 控制追加位置，`--persona-separator` 默认换行分隔。
+- `--style-keywords` 与 `--style-boost` 会根据命中关键词给样本更高 loss 权重，有助于保持优香语调。
 - `--length-prior` 与 `--repeat-penalty` 可用于调节长回复与重复 n-gram 的损失权重。
 
 ## 参考

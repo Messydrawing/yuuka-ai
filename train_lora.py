@@ -4,10 +4,9 @@
 
 from __future__ import annotations
 import argparse
-import os
 import platform
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import torch
 from datasets import load_dataset
@@ -112,6 +111,7 @@ class PromptCompletionCollator:
     def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
         input_ids, attn, labels = [], [], []
         completion_lengths = []
+        style_weights = []
 
         for ex in batch:
             prompt = ex["prompt"]
@@ -133,6 +133,7 @@ class PromptCompletionCollator:
             attn.append(mask)
             labels.append(lbl)
             completion_lengths.append(sum(1 for tok in lbl if tok != -100))
+            style_weights.append(float(ex.get("style_weight", 1.0)))
 
         # 动态 padding 到当前 batch 的最长长度
         maxlen = max(len(x) for x in input_ids)
@@ -148,6 +149,7 @@ class PromptCompletionCollator:
             "attention_mask": torch.tensor(attn, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
             "completion_lengths": torch.tensor(completion_lengths, dtype=torch.float),
+            "style_weights": torch.tensor(style_weights, dtype=torch.float),
         }
 
 
@@ -182,6 +184,7 @@ class LengthAwareTrainer(Trainer):
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
         inputs = inputs.copy()
         inputs.pop("completion_lengths", None)
+        inputs.pop("style_weights", None)
         return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
     def compute_loss(
@@ -192,6 +195,7 @@ class LengthAwareTrainer(Trainer):
         num_items_in_batch: int | None = None,
     ):
         completion_lengths = inputs.pop("completion_lengths", None)
+        style_weights = inputs.pop("style_weights", None)
         labels = inputs.pop("labels")
         outputs = model(**inputs, labels=labels)
         logits = outputs.get("logits") if isinstance(outputs, dict) else outputs.logits
@@ -216,6 +220,11 @@ class LengthAwareTrainer(Trainer):
         else:
             weights = torch.ones_like(per_sample_loss)
 
+        if style_weights is not None:
+            s_weights = style_weights.to(per_sample_loss.device)
+            weights = weights * s_weights.clamp_min(1e-3)
+            weights = weights / weights.mean().clamp_min(1e-6)
+
         loss = (per_sample_loss * weights).mean()
 
         if self.repeat_penalty_weight > 0:
@@ -234,6 +243,56 @@ def load_data(data_dir: Path):
     ds = load_dataset("json", data_files={k: str(p) for k, p in files.items()})
     return ds
 
+
+def resolve_persona(args) -> Optional[str]:
+    persona = args.persona_prefix
+    if args.persona_file is not None:
+        if persona:
+            raise ValueError("--persona-prefix 与 --persona-file 只能二选一")
+        persona = args.persona_file.read_text(encoding="utf-8")
+    if persona:
+        persona = persona.strip()
+    return persona or None
+
+
+def apply_persona_to_dataset(dataset, persona: Optional[str], *, apply_to: str,
+                             separator: str):
+    if not persona:
+        return dataset
+
+    def _add_persona(example: Dict[str, str]) -> Dict[str, str]:
+        ex = dict(example)
+        if apply_to in {"prompt", "both"}:
+            ex["prompt"] = f"{persona}{separator}{example['prompt']}"
+        if apply_to in {"completion", "both"}:
+            ex["completion"] = f"{persona}{separator}{example['completion']}"
+        return ex
+
+    return dataset.map(_add_persona)
+
+
+def attach_style_weights(dataset, *, keywords: List[str], boost: float):
+    if not keywords or boost <= 0:
+        return dataset
+
+    lowered_keywords = [kw.strip().lower() for kw in keywords if kw.strip()]
+    lowered_keywords = [kw for kw in lowered_keywords if kw]
+    if not lowered_keywords:
+        return dataset
+
+    def _calc_weight(example: Dict[str, str]) -> Dict[str, str]:
+        completion = example.get("completion", "")
+        text = completion.lower()
+        count = 0
+        for kw in lowered_keywords:
+            count += text.count(kw)
+        weight = 1.0 + boost * count
+        example = dict(example)
+        example["style_weight"] = max(weight, 1e-3)
+        return example
+
+    return dataset.map(_calc_weight)
+
 def parse_args():
     p = argparse.ArgumentParser("QLoRA fine-tune ChatGLM3/CharacterGLM on Yuuka dialogues")
     p.add_argument("--model-name", type=str, default=DEFAULT_MODEL_NAME)
@@ -249,6 +308,20 @@ def parse_args():
                    help="对训练样本中重复 n-gram 的额外惩罚权重")
     p.add_argument("--repeat-ngram", type=int, default=4,
                    help="重复惩罚所检查的 n-gram 长度")
+    p.add_argument("--persona-prefix", type=str, default=None,
+                   help="在 prompt/completion 前追加的角色设定文本")
+    p.add_argument("--persona-file", type=Path, default=None,
+                   help="包含角色设定的文本文件，等价于 persona-prefix")
+    p.add_argument("--persona-apply", choices=["prompt", "completion", "both"],
+                   default="prompt", help="角色设定追加到 prompt、completion 或两者")
+    p.add_argument("--persona-separator", type=str, default="\n\n",
+                   help="角色设定与原文本之间的分隔符")
+    p.add_argument("--style-keywords", type=str, default="",
+                   help="用于提高优香语气的关键词，逗号分隔")
+    p.add_argument("--style-boost", type=float, default=0.35,
+                   help="每命中一次关键词提升的 loss 权重比例")
+    p.add_argument("--label-smoothing", type=float, default=0.05,
+                   help="label smoothing 系数，帮助输出更顺畅")
     return p.parse_args()
 
 def main():
@@ -257,6 +330,29 @@ def main():
     tok = get_tokenizer(args.model_name)
     model = load_model(args.model_name)
     ds = load_data(args.data_dir)
+    persona_text = resolve_persona(args)
+    if persona_text:
+        print("[INFO] 追加角色设定以强化优香语气")
+    style_keywords = [kw.strip() for kw in args.style_keywords.split(",") if kw.strip()]
+    if style_keywords:
+        print(f"[INFO] 使用关键词强化语调: {style_keywords}")
+
+    processed_splits = {}
+    for split_name, split_ds in ds.items():
+        split_ds = apply_persona_to_dataset(
+            split_ds,
+            persona_text,
+            apply_to=args.persona_apply,
+            separator=args.persona_separator,
+        )
+        split_ds = attach_style_weights(
+            split_ds,
+            keywords=style_keywords,
+            boost=args.style_boost,
+        )
+        processed_splits[split_name] = split_ds
+
+    ds = processed_splits
     collator = PromptCompletionCollator(tok, max_len=args.max_seq_len)
 
     has_val = "validation" in ds
@@ -282,6 +378,7 @@ def main():
         dataloader_num_workers=num_workers,
         remove_unused_columns=False,      # 保留 prompt/completion 列
         report_to=[],
+        label_smoothing_factor=max(args.label_smoothing, 0.0),
     )
 
     trainer = LengthAwareTrainer(
