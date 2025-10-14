@@ -20,6 +20,7 @@ os.environ["HTTPS_PROXY"] = ""
 import json
 import time
 import random
+import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Optional
 
@@ -43,9 +44,9 @@ MEM_DIR = Path("memory")
 MEM_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_MEM_ID = "default"
 
-MAX_NEW_TOKENS = 256
-DEFAULT_TEMPERATURE = 0.9
-DEFAULT_TOP_P = 0.92
+MAX_NEW_TOKENS = 128
+DEFAULT_TEMPERATURE = 0.7
+DEFAULT_TOP_P = 0.9
 DEFAULT_MIN_NEW_TOKENS = 48
 DEFAULT_LENGTH_PENALTY = 1.05
 MIN_REPLY_CHARS = 35
@@ -73,7 +74,7 @@ CHAT_TEMPLATE_FALLBACK = r"""{% for m in messages -%}
 {% if add_generation_prompt %}优香：{% endif %}"""
 
 PERSONA_ITEMS = [
-    {"text": "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；默认称呼对方为“老师/Teacher/sensei”。", "always": True, "base": 3},
+    {"text": "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；默认称呼对方为“老师”。", "always": True, "base": 3},
     {"text": "【persona】价值观：崇尚秩序、计划与自律；对浪费和冲动消费敏感；遇到麻烦会先念叨，再亲自收拾。", "always": True, "base": 2},
     {"text": "【persona】外貌：紫发双马尾、紫瞳、黑蓝立体圆环光环；常穿黑色正装+短裙+黑手套；光环亮时旋转两圈。", "keywords": {"外貌", "打扮", "光环", "双马尾"}, "base": 0.6},
     {"text": "【persona】绰号边界：被称“冷酷的算术使”可接受；被喊“没包人/旱獭/100kg/大魔王”会气鼓鼓（但还是会帮忙）。", "keywords": {"绰号", "外号", "没包人", "旱獭", "大魔王"}, "base": 1.2},
@@ -324,7 +325,12 @@ def ensure_teacher_prefix(s: str) -> str:
 
 # =============== 文本后处理（去开场白） ===============
 _BAD_STARTS = ["好的", "好吧", "行吧", "行的", "明白", "了解", "那我", "那就", "嗯", "啊这", "好的，我", "好的，那"]
-BANNED_PHRASES = ["作为AI", "作为 AI", "作为大语言模型", "我只是一个AI", "无法访问网络"]
+BANNED_PHRASES = [
+    "作为AI", "作为 AI", "作为一个AI", "作为大语言模型", "语言模型", "我只是一个AI", "我不能", "无法访问网络", "抱歉",
+    "sourceMappingURL", "Teacher", "teacher", "sensei"
+]
+_URL_RE = re.compile(r"(https?://\S+|www\.\S+)")
+_TAG_RE = re.compile(r"(?:^|\s)#\S+")
 def _strip_bland_openers(text: str) -> str:
     t = text.lstrip()
     for _ in range(3):
@@ -343,6 +349,16 @@ def _strip_bland_openers(text: str) -> str:
         if not matched:
             break
     return t or text
+
+
+def _sanitize(text: str) -> str:
+    if not text:
+        return text
+    t = _URL_RE.sub("", text)
+    t = _TAG_RE.sub("", t)
+    t = t.replace("Teacher", "老师").replace("teacher", "老师").replace("sensei", "老师")
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
 
 
 def violates_rules(text: str) -> bool:
@@ -489,6 +505,8 @@ def load_model():
 
 # ====== 初始化 ======
 tokenizer, model = load_model()
+BAN_STRINGS = ["http", "https", "www.", "sourceMappingURL", "#", "Teacher", "teacher", "sensei"]
+BAD_WORDS_IDS = [ids for s in BAN_STRINGS if (ids := tokenizer.encode(s, add_special_tokens=False))]
 hard_mem = HardMemory(HARD_MEM_PATH)
 
 # =============== 手工编码：彻底绕过 tokenizer._pad() ===============
@@ -607,6 +625,7 @@ def generate_one(msgs: List[Dict[str,str]], max_new_tokens, temperature, top_p,
         torch.manual_seed(seed); random.seed(seed)
     prompt = _apply_chat_template(msgs)
     inputs = _encode_to_inputs(prompt)
+    max_new_tokens = int(max_new_tokens)
     min_new = int(min_new_tokens) if min_new_tokens else 0
     if max_new_tokens and min_new >= max_new_tokens:
         min_new = max(1, max_new_tokens - 1)
@@ -618,15 +637,19 @@ def generate_one(msgs: List[Dict[str,str]], max_new_tokens, temperature, top_p,
                 max_new_tokens=max_new_tokens,
                 min_new_tokens=max(1, min_new) if max_new_tokens else None,
                 do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                length_penalty=length_penalty,
-                use_cache=False,
+                temperature=float(temperature),
+                top_p=float(top_p),
+                repetition_penalty=float(repetition_penalty),
+                no_repeat_ngram_size=int(no_repeat_ngram_size),
+                length_penalty=float(length_penalty),
+                bad_words_ids=BAD_WORDS_IDS,
+                use_cache=True,
+                pad_token_id=getattr(tokenizer, "pad_token_id", None),
+                eos_token_id=getattr(tokenizer, "eos_token_id", None),
             )
         text = decode_reply(out, inputs)
         text = _strip_bland_openers(text)
+        text = _sanitize(text)
         if not text.strip():
             last_text = text
             continue
@@ -769,13 +792,13 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
     with gr.Row():
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
         top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.05, label="Top-p")
-        repetition_penalty = gr.Slider(1.0, 1.3, value=1.05, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=3, step=1, label="no_repeat_ngram_size")
+        repetition_penalty = gr.Slider(1.0, 1.3, value=1.12, step=0.01, label="重复惩罚")
+        no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
         diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
         k_candidates = gr.Slider(1, 3, value=2, step=1, label="候选数 k")
-        max_new = gr.Slider(64, 512, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
+        max_new = gr.Slider(64, 256, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
 
     chat = gr.Chatbot(height=520, label="与优香对话", type="tuples")
     txt = gr.Textbox(placeholder="和优香聊点什么吧…（直接输入即可）", show_label=False)
