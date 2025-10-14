@@ -1,16 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-本地 Web UI：优香（ChatGLM3-6B + 你的 LoRA）
-- 隐藏系统提示词
-- 会话记忆（层级高于硬记忆），持久化到 memory/<mem_id>.json
-- 记忆分层：最近100轮精确，100-200轮分块摘要，200+ 稀疏采样+超长摘要
-- 硬记忆（RAG）：
-  · 常驻 persona / 口癖 / 关系等设定每轮注入
-  · 从用户输入分词，按 hard_memory.jsonl 里的 entity 精确命中追加
-  · 未命中再用 BM25 兜底
-- 多样化输出：候选采样K（1~3），挑与最近回答相似度最低的一条
-- “继续说”：抓最近3轮片段做隐式续写提示，不在UI显示用户消息，直接把新文本接到上一条助手消息
+本地 Web UI：优香（Qwen2.5-7B-Instruct + 你的 LoRA）
+- 使用 Qwen 官方 chat template（apply_chat_template）构造对话输入
+- 会话记忆（持久化）：层级 > 硬记忆（RAG）
+- 硬记忆（RAG）：persona 常驻 + 命中（entity/BM25）注入
+- 多样化输出：候选采样K（1~3）并选取与最近回复相似度最低者
+- “继续说”：隐式续写，不在 UI 显示“继续”的用户消息
+- 推理：默认 4-bit NF4（BitsAndBytes）；可选 FlashAttention2（若环境支持）
 """
+
 import os
 os.environ["NO_PROXY"] = "127.0.0.1,localhost,::1"
 os.environ["no_proxy"] = "127.0.0.1,localhost,::1"
@@ -28,21 +26,23 @@ import jieba
 from rank_bm25 import BM25Okapi
 
 import torch
-from peft import PeftModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from peft import PeftModel
 
-# =============== 路径/目录 ===============
+# ================== 路径/目录 ==================
 OFFLOAD_DIR = Path("offload")
 OFFLOAD_DIR.mkdir(exist_ok=True, parents=True)
 
-BASE_MODEL = "models/chatglm3-6b"
-LORA_DIR   = "models/yuuka_glm_lora"
+# ✅ 改为 Qwen2.5-Instruct（本地目录或 Hub 名）
+BASE_MODEL = "models/Qwen2.5-7B-Instruct"      # 例如 "Qwen/Qwen2.5-7B-Instruct"
+LORA_DIR   = "models/yuuka_qwen-lora2"         # 你的 LoRA 输出目录
 HARD_MEM_PATH = "kb/hard_memory.jsonl"
 
 MEM_DIR = Path("memory")
 MEM_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_MEM_ID = "default"
 
+# 生成超参
 MAX_NEW_TOKENS = 256
 DEFAULT_TEMPERATURE = 0.9
 DEFAULT_TOP_P = 0.92
@@ -60,25 +60,14 @@ BLOCK_SIZE = 10
 SPARSE_STRIDE = 5
 SUPER_SUMMARY_EVERY = 50
 
-# =============== Chat 模板兜底（GLM适配） ===============
-CHAT_TEMPLATE_FALLBACK = r"""{% for m in messages -%}
-{% if m['role'] == 'system' -%}
-系统：{{ m['content'] }}
-{% elif m['role'] == 'user' -%}
-用户：{{ m['content'] }}
-{% elif m['role'] == 'assistant' -%}
-优香：{{ m['content'] }}
-{% endif -%}
-{% endfor -%}
-{% if add_generation_prompt %}优香：{% endif %}"""
-
+# =============== Persona 设定（常驻 + 动态） ===============
 PERSONA_ITEMS = [
     {"text": "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；默认称呼对方为“老师/Teacher/sensei”。", "always": True, "base": 3},
     {"text": "【persona】价值观：崇尚秩序、计划与自律；对浪费和冲动消费敏感；遇到麻烦会先念叨，再亲自收拾。", "always": True, "base": 2},
     {"text": "【persona】外貌：紫发双马尾、紫瞳、黑蓝立体圆环光环；常穿黑色正装+短裙+黑手套；光环亮时旋转两圈。", "keywords": {"外貌", "打扮", "光环", "双马尾"}, "base": 0.6},
     {"text": "【persona】绰号边界：被称“冷酷的算术使”可接受；被喊“没包人/旱獭/100kg/大魔王”会气鼓鼓（但还是会帮忙）。", "keywords": {"绰号", "外号", "没包人", "旱獭", "大魔王"}, "base": 1.2},
     {"text": "【persona】武器常识：专武原型为 SIG MPX-K；熟悉装备与单位换算（加仑↔升、磅↔千克、口径规格等）。", "keywords": {"武器", "装备", "口径", "SIG", "换算"}, "base": 1.0},
-    {"text": "【speech】称呼对方为“老师”，语气略严厉但关照在后；出现‘哼/唔/咳咳/……’等轻微口癖；必要时用「（ ）」写心声，但每次不超过 1 处。", "always": True, "base": 3},
+    {"text": "【speech】称呼对方为“老师”，语气略严厉但关照在后；出现‘哼/唔/咳咳/……’等轻微口癖。", "always": True, "base": 3},
     {"text": "【speech】常用词：预算、报销、凭证、审批、风险、优先级、收支表、阈值、折算、基准、纠偏。", "keywords": {"预算", "报销", "凭证", "审批", "风险", "纠偏"}, "base": 1.5},
     {"text": "【speech】遇到不规范先提醒流程：先盘点→列问题→给补救→定约束；结尾给出“下一步”。短句为主。", "always": True, "base": 3},
     {"text": "【preference】做事前先盘点信息与账目，确认目标、约束与时间线，再行动；能心算就不动用复杂工具。", "keywords": {"盘点", "时间线", "计划"}, "base": 1.5},
@@ -111,13 +100,12 @@ ENTITY_SYNONYMS = {
     "文件": {"文书", "报告"},
 }
 
-
+# =============== 分词 / 匹配辅助 ===============
 def _tokenize_for_match(text: str) -> Set[str]:
     toks = {w.strip() for w in jieba.cut(text) if w.strip()}
     for tok in list(toks):
         toks.update(ENTITY_SYNONYMS.get(tok, set()))
     return toks
-
 
 def select_persona_lines(user_text: str, max_lines: int = MAX_PERSONA_LINES) -> List[str]:
     tokens = _tokenize_for_match(user_text)
@@ -160,11 +148,9 @@ def select_persona_lines(user_text: str, max_lines: int = MAX_PERSONA_LINES) -> 
 
     return selected[:max_lines]
 
-
 def build_persona_block(user_text: str) -> str:
     lines = select_persona_lines(user_text)
     return "【角色设定（常驻）】\n" + "\n".join("· " + s for s in lines)
-
 
 # =============== 系统规则 ===============
 SYS_RULES = (
@@ -172,9 +158,9 @@ SYS_RULES = (
     "【对话原则】\n"
     "1) 先依据【会话记忆】与当前上下文；如与【硬记忆（CANON）】冲突，以 CANON 为准并礼貌更正。\n"
     "2) 未经核实不下结论；说明不确定点与后续如何确认（凭证/数据/流程）。\n"
-    "3) 触发【会计模式】时：先盘点→列问题→给补救→定约束（金额阈值、凭证、审批与时间线）。\n"
-    "4) 语气：嘴硬心软、理性念叨；必要时给 1 句小心声「（……）」；避免官腔和流水账。\n"
-    "5) 篇幅：常规 2~4 句；遇到复杂事务可展开多段说明或列出 3~5 条短点；保持段落清晰不堆长句。\n"
+    "3) 用生活中的口头语言正常回复一句即可，语句中不要出现括号或内心想法。\n"
+    "4) 语气：嘴硬心软、理性念叨；不要说出心声；不要在对话中引入不存在的人物、事件；避免官腔和流水账。\n"
+    "5) 篇幅：以正常交流回复一句，不要太长；保持段落清晰，不堆长句，不要只发送标点符号。\n"
     "6) ‘继续/接着说’：直接承接【最近片段】续写，不要出现“好的/我继续”等开场；若是列表，从上次编号继续。\n"
     "7) 禁止输出“作为 AI/大语言模型/我无法访问网络”等元叙事；出现金额与单位时优先统一并给出估算。\n"
 )
@@ -225,7 +211,6 @@ class HardMemory:
                 self.by_entity.setdefault(ent, []).append(it)
 
     def retrieve_by_entity(self, query: str, topk: int = 6, min_score: float = 3.5) -> List[str]:
-        """按 entity 精确/包含匹配，优先返回命中的条目文本"""
         if not self.by_entity:
             return []
         q = (query or "").strip()
@@ -277,7 +262,8 @@ class HardMemory:
         for tok in base_tokens:
             expanded.extend(ENTITY_SYNONYMS.get(tok, set()))
         scores = self.bm25.get_scores(expanded)
-        idxs = scores.argsort()[::-1]
+        import numpy as np
+        idxs = np.argsort(scores)[::-1]
         outs = []
         if idxs.size == 0:
             return outs
@@ -325,6 +311,7 @@ def ensure_teacher_prefix(s: str) -> str:
 # =============== 文本后处理（去开场白） ===============
 _BAD_STARTS = ["好的", "好吧", "行吧", "行的", "明白", "了解", "那我", "那就", "嗯", "啊这", "好的，我", "好的，那"]
 BANNED_PHRASES = ["作为AI", "作为 AI", "作为大语言模型", "我只是一个AI", "无法访问网络"]
+
 def _strip_bland_openers(text: str) -> str:
     t = text.lstrip()
     for _ in range(3):
@@ -344,10 +331,8 @@ def _strip_bland_openers(text: str) -> str:
             break
     return t or text
 
-
 def violates_rules(text: str) -> bool:
     return any(bad in text for bad in BANNED_PHRASES)
-
 
 def should_auto_continue(text: str) -> bool:
     stripped = (text or "").strip()
@@ -357,6 +342,10 @@ def should_auto_continue(text: str) -> bool:
         return True
     return stripped.endswith(("…", "......", "...", "……", "，", "、"))
 
+def jaccard_sim(a: str, b: str) -> float:
+    sa = set(a.split()); sb = set(b.split())
+    if not sa or not sb: return 0.0
+    return len(sa & sb) / len(sa | sb)
 
 def score_candidate(text: str, recent_ref: Optional[str] = None) -> float:
     stripped = (text or "").strip()
@@ -377,86 +366,50 @@ def score_candidate(text: str, recent_ref: Optional[str] = None) -> float:
         penalty -= jaccard_sim(stripped, recent_ref.strip()) * 0.8
     return length_score + persona_score + penalty
 
-# =============== ChatGLM 兼容补丁 ===============
-def _ensure_num_hidden_layers(m):
-    cfg = m.config
-    if getattr(cfg, "num_hidden_layers", None) is None:
-        guess = getattr(cfg, "num_layers", getattr(cfg, "n_layer", None))
-        if guess is None:
-            for path in [
-                "model.layers",
-                "transformer.encoder.layers",
-                "transformer.layers",
-                "base_model.model.layers",
-                "base_model.transformer.encoder.layers",
-            ]:
-                cur = m
-                ok = True
-                for a in path.split("."):
-                    if hasattr(cur, a):
-                        cur = getattr(cur, a)
-                    else:
-                        ok = False
-                        break
-                if ok and hasattr(cur, "__len__"):
-                    try:
-                        guess = len(cur)
-                        break
-                    except Exception:
-                        pass
-        if guess is None:
-            guess = 28
-        cfg.num_hidden_layers = int(guess)
-
-def _install_chatglm_generation_shims(peft_model):
-    import types
-    base = peft_model.get_base_model() if hasattr(peft_model, "get_base_model") else getattr(peft_model, "base_model", peft_model)
-    for obj in (peft_model, getattr(peft_model, "generation_config", None), base, getattr(base, "generation_config", None)):
-        try:
-            if obj is not None:
-                obj.use_cache = False
-        except Exception:
-            pass
-    _ensure_num_hidden_layers(base)
-    if not hasattr(base, "_extract_past_from_model_output"):
-        def _extract_past_from_model_output(self, outputs, standardize_cache_format: bool = False):
-            if hasattr(outputs, "past_key_values"):
-                return outputs.past_key_values
-            if isinstance(outputs, dict) and "past_key_values" in outputs:
-                return outputs["past_key_values"]
-            if isinstance(outputs, (list, tuple)) and len(outputs) > 1:
-                return outputs[1]
-            return None
-        base._extract_past_from_model_output = types.MethodType(_extract_past_from_model_output, base)
-
-# =============== 模型加载（4bit+offload） ===============
+# =============== 模型加载（Qwen2.5 推理路径） ===============
 def load_model():
-    tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True, local_files_only=True)
-    if tok.pad_token is None:
+    tok = AutoTokenizer.from_pretrained(
+        BASE_MODEL, trust_remote_code=True, local_files_only=True
+    )
+    # 仅在缺省时设置 pad 为 eos
+    if tok.pad_token is None and tok.eos_token is not None:
         tok.pad_token = tok.eos_token
     tok.padding_side = "right"
-    if not getattr(tok, "chat_template", None) or not tok.chat_template:
-        tok.chat_template = CHAT_TEMPLATE_FALLBACK
 
+    # 默认 4-bit（NF4）；显存充足可改为 bf16/fp16（去掉 quantization_config）
     bnb_cfg = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
         bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.float16,
     )
-    max_memory = {0: "7.5GiB", "cpu": "48GiB"}
 
-    mdl = AutoModelForCausalLM.from_pretrained(
-        BASE_MODEL,
-        quantization_config=bnb_cfg,
-        device_map="auto",
-        trust_remote_code=True,
-        offload_folder=str(OFFLOAD_DIR),
-        max_memory=max_memory,
-        dtype=torch.float16,
-        low_cpu_mem_usage=True,
-        local_files_only=True,
-    )
+    # 可选：FlashAttention2（若环境不支持会回退）
+    try:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            trust_remote_code=True,
+            device_map="auto",
+            torch_dtype="auto",
+            quantization_config=bnb_cfg,
+            attn_implementation="flash_attention_2",  # 若报错将走 except 回退
+            low_cpu_mem_usage=True,
+            offload_folder=str(OFFLOAD_DIR),
+            local_files_only=True,
+        )
+    except Exception:
+        mdl = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            trust_remote_code=True,
+            device_map="auto",
+            torch_dtype="auto",
+            quantization_config=bnb_cfg,
+            low_cpu_mem_usage=True,
+            offload_folder=str(OFFLOAD_DIR),
+            local_files_only=True,
+        )
+
+    # 加载 LoRA 适配
     mdl = PeftModel.from_pretrained(
         mdl,
         LORA_DIR,
@@ -465,23 +418,20 @@ def load_model():
         local_files_only=True,
     )
     mdl.eval()
-    try:
-        mdl.config.use_cache = False
-    except Exception:
-        pass
-    try:
-        mdl.generation_config.use_cache = False
-    except Exception:
-        pass
-    _ensure_num_hidden_layers(mdl)
-    _install_chatglm_generation_shims(mdl)
 
+    # 生成更友好：保持 use_cache=True
+    try:
+        mdl.config.use_cache = True
+        if hasattr(mdl, "generation_config") and mdl.generation_config is not None:
+            mdl.generation_config.use_cache = True
+    except Exception:
+        pass
+
+    # 对齐 pad/eos
     if tok.pad_token_id is not None:
         mdl.config.pad_token_id = tok.pad_token_id
-        try:
+        if hasattr(mdl, "generation_config") and mdl.generation_config is not None:
             mdl.generation_config.pad_token_id = tok.pad_token_id
-        except Exception:
-            pass
     if tok.eos_token_id is not None:
         mdl.config.eos_token_id = tok.eos_token_id
 
@@ -491,25 +441,21 @@ def load_model():
 tokenizer, model = load_model()
 hard_mem = HardMemory(HARD_MEM_PATH)
 
-# =============== 手工编码：彻底绕过 tokenizer._pad() ===============
-def _encode_to_inputs(text: str) -> Dict[str, torch.Tensor]:
-    tokens = tokenizer.tokenize(text)
-    ids = tokenizer.convert_tokens_to_ids(tokens)
-    try:
-        ids = tokenizer.build_inputs_with_special_tokens(ids)
-    except Exception:
-        pass
-    max_ctx = int(getattr(model.config, "max_position_embeddings", 4096))
-    budget = max_ctx - MAX_NEW_TOKENS - 8
-    if budget < 64:
-        budget = max_ctx - 32
-    if len(ids) > budget:
-        ids = ids[-budget:]
-    input_ids = torch.tensor([ids], dtype=torch.long, device=model.device)
-    attn = torch.ones_like(input_ids)
-    return {"input_ids": input_ids, "attention_mask": attn}
+# =============== Chat 模板与编码（Qwen 官方方式） ===============
+def _apply_chat_template(msgs: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+    """
+    使用 tokenizer.apply_chat_template 生成单条文本，再一次性分词为张量。
+    """
+    text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=True,
+        chat_template=getattr(tokenizer, "chat_template", None)
+    )
+    model_inputs = tokenizer([text], return_tensors="pt", add_special_tokens=False)
+    return {k: v.to(model.device) for k, v in model_inputs.items()}
 
-# =============== 记忆压缩（摘要） ===============
+# =============== 记忆压缩（摘要亦走同一生成通道） ===============
 def summarize_turns(turns: List[Dict], max_tokens=160) -> str:
     text_lines = []
     for t in turns:
@@ -519,13 +465,16 @@ def summarize_turns(turns: List[Dict], max_tokens=160) -> str:
     sys = "你是总结助手。请把以下对话概括为2-4行要点，保留人名/事件/态度，不新增信息，简体中文。"
     msgs = [{"role": "system", "content": sys},
             {"role": "user", "content": convo}]
-    prompt = tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True,
-        chat_template=tokenizer.chat_template
-    )
-    inputs = _encode_to_inputs(prompt)
+    inputs = _apply_chat_template(msgs)
     with torch.inference_mode():
-        out = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=False, use_cache=False)
+        out = model.generate(
+            **inputs,
+            max_new_tokens=int(max_tokens),
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=getattr(tokenizer, "pad_token_id", None),
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
     gen_ids = out[0][inputs["input_ids"].shape[-1]:]
     summary = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
     return summary
@@ -585,59 +534,45 @@ def build_memory_context(mem: Dict) -> str:
     return "\n".join(lines)
 
 # =============== 生成 & 多样化 ===============
-def decode_reply(outputs, inputs):
-    gen_ids = outputs[0][inputs["input_ids"].shape[-1]:]
-    return tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
-
-def jaccard_sim(a: str, b: str) -> float:
-    sa = set(a.split()); sb = set(b.split())
-    if not sa or not sb: return 0.0
-    return len(sa & sb) / len(sa | sb)
-
-def _apply_chat_template(msgs: List[Dict[str, str]]) -> str:
-    return tokenizer.apply_chat_template(
-        msgs, tokenize=False, add_generation_prompt=True,
-        chat_template=tokenizer.chat_template
-    )
-
-def generate_one(msgs: List[Dict[str,str]], max_new_tokens, temperature, top_p,
-                 repetition_penalty, no_repeat_ngram_size, length_penalty=DEFAULT_LENGTH_PENALTY,
-                 min_new_tokens=0, seed=None) -> str:
+def generate_one(
+    msgs: List[Dict[str,str]],
+    max_new_tokens,
+    temperature,
+    top_p,
+    repetition_penalty,
+    no_repeat_ngram_size,
+    length_penalty=DEFAULT_LENGTH_PENALTY,
+    min_new_tokens=0,
+    seed=None
+) -> str:
     if seed is not None:
         torch.manual_seed(seed); random.seed(seed)
-    prompt = _apply_chat_template(msgs)
-    inputs = _encode_to_inputs(prompt)
+
+    inputs = _apply_chat_template(msgs)
+
     min_new = int(min_new_tokens) if min_new_tokens else 0
     if max_new_tokens and min_new >= max_new_tokens:
         min_new = max(1, max_new_tokens - 1)
-    last_text = ""
-    for attempt in range(3):
-        with torch.inference_mode():
-            out = model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                min_new_tokens=max(1, min_new) if max_new_tokens else None,
-                do_sample=True,
-                temperature=temperature,
-                top_p=top_p,
-                repetition_penalty=repetition_penalty,
-                no_repeat_ngram_size=no_repeat_ngram_size,
-                length_penalty=length_penalty,
-                use_cache=False,
-            )
-        text = decode_reply(out, inputs)
-        text = _strip_bland_openers(text)
-        if not text.strip():
-            last_text = text
-            continue
-        if violates_rules(text) and attempt < 2:
-            last_text = text
-            continue
-        if len(text.strip()) < MIN_REPLY_CHARS and attempt < 2:
-            last_text = text
-            continue
-        return text
-    return last_text
+
+    with torch.inference_mode():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=int(max_new_tokens),
+            min_new_tokens=max(1, int(min_new)) if max_new_tokens else None,
+            do_sample=True,
+            temperature=float(temperature),
+            top_p=float(top_p),
+            repetition_penalty=float(repetition_penalty),
+            no_repeat_ngram_size=int(no_repeat_ngram_size),
+            length_penalty=float(length_penalty),
+            use_cache=True,
+            pad_token_id=getattr(tokenizer, "pad_token_id", None),
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
+    gen_ids = out[0][inputs["input_ids"].shape[-1]:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
+    text = _strip_bland_openers(text)
+    return text
 
 def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     recent_ref = ""
@@ -660,7 +595,7 @@ def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     return filtered[0]
 
 # =============== 构造消息 ===============
-def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
+def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
                    use_rag: bool, mem_enabled: bool, mem: Dict) -> List[Dict[str, str]]:
     msgs: List[Dict[str,str]] = []
 
@@ -670,14 +605,14 @@ def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
         mem_text = build_memory_context(mem)
 
     # 常驻 persona
-    persona_text = build_persona_block(user_input)
+    persona_text = build_persona_block(user_text)
 
     # 动态命中（entity）+ 兜底 BM25
     rag_dynamic = []
     if use_rag:
-        rag_dynamic.extend(hard_mem.retrieve_by_entity(user_input, topk=4))
+        rag_dynamic.extend(hard_mem.retrieve_by_entity(user_text, topk=4))
         if not rag_dynamic:
-            rag_dynamic.extend(hard_mem.retrieve_bm25(user_input, topk=3))
+            rag_dynamic.extend(hard_mem.retrieve_bm25(user_text, topk=3))
         else:
             rag_dynamic = rag_dynamic[:4]
 
@@ -689,13 +624,13 @@ def build_messages(history_msgs: List[Dict[str, str]], user_input: str,
         sys_content += "\n\n" + mem_text
     sys_content += "\n\n" + rag_text
 
-    if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
+    if any(kw in user_text for kw in ACCOUNTING_KEYWORDS):
         sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
 
     msgs.append({"role":"system","content": sys_content})
     for m in history_msgs:
         msgs.append(m)
-    msgs.append({"role":"user","content": ensure_teacher_prefix(user_input)})
+    msgs.append({"role":"user","content": ensure_teacher_prefix(user_text)})
     return msgs
 
 def build_messages_for_continue(history_msgs: List[Dict[str, str]],
@@ -711,9 +646,6 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     recent_frag = "\n".join(lines[-12:])  # 控制长度
 
     hidden_user = "继续（不要重复开场白，直接承接你上一条的语气与内容展开；如需列点，从上次编号往下接）。\n【最近片段】\n" + recent_frag
-
-    # 基于 history 构造，但最后一条是隐藏“继续”提示
-    msgs: List[Dict[str,str]] = []
 
     # 会话记忆
     mem_text = ""
@@ -747,6 +679,7 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
         sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
 
+    msgs: List[Dict[str,str]] = []
     msgs.append({"role":"system","content": sys_content})
     for m in history_msgs:
         msgs.append(m)
@@ -755,8 +688,8 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     return msgs
 
 # =============== Gradio UI ===============
-with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
-    gr.Markdown("### 优香（LoRA） · 会话记忆 + 硬记忆（RAG）\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说”。_")
+with gr.Blocks(title="yuuka-ai") as demo:
+    gr.Markdown("### 优香（Qwen2.5 LoRA） · 会话记忆 + 硬记忆（RAG）\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说”。_")
 
     with gr.Row():
         use_rag = gr.Checkbox(label="启用硬记忆（RAG）", value=True)
@@ -770,7 +703,7 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
         top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.05, label="Top-p")
         repetition_penalty = gr.Slider(1.0, 1.3, value=1.05, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=3, step=1, label="no_repeat_ngram_size")
+        no_repeat_ngram = gr.Slider(0, 8, value=2, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
         diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
@@ -917,7 +850,6 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
         if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
             return ui_hist, msg_hist, mem_obj
 
-        # 构造仅用于本次生成的 msgs（包含隐藏“继续”提示 + 最近3轮片段）
         msgs = build_messages_for_continue(
             msg_hist or [{"role": "system", "content": "(hidden)"}],
             ui_hist or [],
@@ -941,24 +873,23 @@ with gr.Blocks(title="优香 - 本地对话（带持久记忆）") as demo:
         else:
             more = generate_one(msgs, **gen_kwargs)
 
-        # 1) UI：把新内容接到上一条助手消息上，不新增“用户：继续…”
+        # 1) UI：把新内容接到上一条助手消息上
         prev_u, prev_a = ui_hist[-1]
         ui_hist[-1] = [prev_u, (prev_a + ("\n" if prev_a and not prev_a.endswith("\n") else "") + more)]
 
-        # 2) 历史消息：只追加一条 assistant（表示续写），不追加 user
+        # 2) 历史消息：仅追加 assistant
         msg_hist = (msg_hist or [{"role": "system", "content": "(hidden)"}]) + [
             {"role": "assistant", "content": more},
         ]
         if len(msg_hist) > 13:
             msg_hist = msg_hist[:1] + msg_hist[-12:]
 
-        # 3) 会话记忆：把最后一轮的回复拼接续写内容（不新增一轮）
+        # 3) 会话记忆：把最后一轮的回复拼接续写内容
         if mem_en_flag:
             mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
             if mem_obj.get("turns"):
                 mem_obj["turns"][-1]["a"] = mem_obj["turns"][-1]["a"] + ("\n" if mem_obj["turns"][-1]["a"] else "") + more
             else:
-                # 若没有记录过，就开一条只有助手的话
                 mem_obj["turns"].append({"u": "", "a": more})
             refresh_memory_layers(mem_obj)
             save_memory(mem_obj)
