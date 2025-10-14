@@ -46,7 +46,7 @@ DEFAULT_MEM_ID = "default"
 # 生成超参
 MAX_NEW_TOKENS = 128
 DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.9
+DEFAULT_TOP_P = 0.95
 DEFAULT_MIN_NEW_TOKENS = 48
 DEFAULT_LENGTH_PENALTY = 1.05
 MIN_REPLY_CHARS = 35
@@ -164,6 +164,7 @@ SYS_RULES = (
     "5) 篇幅：以正常交流回复一句，不要太长；保持段落清晰，不堆长句，不要只发送标点符号。\n"
     "6) ‘继续/接着说’：直接承接【最近片段】续写，不要出现“好的/我继续”等开场；若是列表，从上次编号继续。\n"
     "7) 禁止输出“作为 AI/大语言模型/我无法访问网络”等元叙事；出现金额与单位时优先统一并给出估算。\n"
+    "8) 不要连环发问；除非用户明确要求，不要自创设定或延展额外剧情。\n"
 )
 
 # =============== 硬记忆（RAG） ===============
@@ -329,6 +330,29 @@ def _sanitize(text: str) -> str:
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
+
+def _limit_sentences(text: str, max_sents: int = 2, max_questions: int = 1) -> str:
+    import re as _re
+
+    if not text:
+        return text
+
+    sents = _re.split(r"(?<=[。！？!?])\s*", text)
+    sents = [s.strip() for s in sents if s.strip()]
+    kept = []
+    question_count = 0
+    for s in sents:
+        has_question = ('?' in s) or ('？' in s)
+        if has_question and question_count >= max_questions:
+            continue
+        question_count += 1 if has_question else 0
+        kept.append(s)
+        if len(kept) >= max_sents:
+            break
+    if not kept and sents:
+        kept.append(sents[0])
+    return " ".join(kept) if kept else text
+
 def _strip_bland_openers(text: str) -> str:
     t = text.lstrip()
     for _ in range(3):
@@ -350,6 +374,37 @@ def _strip_bland_openers(text: str) -> str:
 
 def violates_rules(text: str) -> bool:
     return any(bad in text for bad in BANNED_PHRASES)
+
+
+def refine_short(text: str, tokenizer, model) -> str:
+    if not text:
+        return text
+
+    sys = "把回答改写为 1-2 句，逻辑连贯，不新增任何设定，最多一个澄清问句。"
+    messages = [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": text},
+    ]
+    ids = tokenizer.apply_chat_template(
+        messages,
+        add_generation_prompt=True,
+        tokenize=True,
+        return_tensors="pt",
+    ).to(model.device)
+    with torch.inference_mode():
+        out = model.generate(
+            ids,
+            do_sample=True,
+            temperature=0.2,
+            typical_p=0.95,
+            max_new_tokens=96,
+            use_cache=True,
+            pad_token_id=getattr(tokenizer, "pad_token_id", None),
+            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+        )
+    gen = tokenizer.decode(out[0][ids.shape[-1]:], skip_special_tokens=True)
+    refined = _limit_sentences(_sanitize(gen), 2, 1)
+    return refined or text
 
 def should_auto_continue(text: str) -> bool:
     stripped = (text or "").strip()
@@ -561,6 +616,7 @@ def generate_one(
     top_p,
     repetition_penalty,
     no_repeat_ngram_size,
+    typical_p=None,
     length_penalty=DEFAULT_LENGTH_PENALTY,
     min_new_tokens=0,
     seed=None
@@ -575,13 +631,11 @@ def generate_one(
         min_new = max(1, max_new_tokens - 1)
 
     with torch.inference_mode():
-        out = model.generate(
-            **inputs,
+        gen_kwargs = dict(
             max_new_tokens=int(max_new_tokens),
             min_new_tokens=max(1, int(min_new)) if max_new_tokens else None,
             do_sample=True,
             temperature=float(temperature),
-            top_p=float(top_p),
             repetition_penalty=float(repetition_penalty),
             no_repeat_ngram_size=int(no_repeat_ngram_size),
             length_penalty=float(length_penalty),
@@ -590,10 +644,20 @@ def generate_one(
             pad_token_id=getattr(tokenizer, "pad_token_id", None),
             eos_token_id=getattr(tokenizer, "eos_token_id", None),
         )
+        if typical_p is not None and float(typical_p) < 0.999:
+            gen_kwargs["typical_p"] = float(typical_p)
+        else:
+            gen_kwargs["top_p"] = float(top_p)
+
+        out = model.generate(
+            **inputs,
+            **gen_kwargs,
+        )
     gen_ids = out[0][inputs["input_ids"].shape[-1]:]
     text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
     text = _strip_bland_openers(text)
-    return _sanitize(text)
+    text = _sanitize(text)
+    return _limit_sentences(text, max_sents=2, max_questions=1)
 
 def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     recent_ref = ""
@@ -722,14 +786,16 @@ with gr.Blocks(title="yuuka-ai") as demo:
 
     with gr.Row():
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
-        top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.05, label="Top-p")
-        repetition_penalty = gr.Slider(1.0, 1.3, value=1.12, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
+        top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.01, label="Top-p")
+        typical_slider = gr.Slider(0.5, 1.0, value=0.95, step=0.01, label="typical_p（与 Top-p 二选一）")
+        repetition_penalty = gr.Slider(1.0, 1.3, value=1.18, step=0.01, label="重复惩罚")
+        no_repeat_ngram = gr.Slider(0, 8, value=6, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
         diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
         k_candidates = gr.Slider(1, 3, value=2, step=1, label="候选数 k")
         max_new = gr.Slider(64, 512, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
+        refine_enabled = gr.Checkbox(label="启用二阶段精修", value=False)
 
     chat = gr.Chatbot(height=520, label="与优香对话", type="tuples")
     txt = gr.Textbox(placeholder="和优香聊点什么吧…（直接输入即可）", show_label=False)
@@ -766,7 +832,7 @@ with gr.Blocks(title="yuuka-ai") as demo:
     # === 发消息 ===
     def _send(user_input, ui_hist, msg_hist, mem_obj,
               use_rag_flag, mem_en_flag,
-              temp, topp, rep_pen, ngram, diverse_flag, k_cand, max_tokens):
+              temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
 
         if not user_input.strip():
             return ui_hist, msg_hist, mem_obj
@@ -779,6 +845,7 @@ with gr.Blocks(title="yuuka-ai") as demo:
             max_new_tokens=max_new,
             temperature=float(temp),
             top_p=float(topp),
+            typical_p=float(typical_val),
             repetition_penalty=float(rep_pen),
             no_repeat_ngram_size=int(ngram),
             length_penalty=DEFAULT_LENGTH_PENALTY,
@@ -793,6 +860,8 @@ with gr.Blocks(title="yuuka-ai") as demo:
             return generate_one(msgs_for_gen, **gen_kwargs)
 
         reply = _sample_reply(msgs, ui_hist or []) or ""
+        if refine_flag:
+            reply = refine_short(reply, tokenizer, model)
 
         ui_hist_next = list(ui_hist or [])
         ui_hist_next.append([user_input, reply])
@@ -810,28 +879,31 @@ with gr.Blocks(title="yuuka-ai") as demo:
                 temp_ui.append([pair, ""])
         temp_msgs = list(msg_hist_next)
         current_reply = reply
-        for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
-            if not should_auto_continue(current_reply):
-                break
-            msgs_continue = build_messages_for_continue(
-                temp_msgs,
-                temp_ui,
-                use_rag_flag,
-                mem_en_flag,
-                mem_obj,
-            )
-            more = _sample_reply(msgs_continue, temp_ui)
-            if not more or violates_rules(more) or not more.strip():
-                break
-            if len(more.strip()) < 6 and len(current_reply.strip()) > MIN_REPLY_CHARS:
-                break
-            if not current_reply.endswith("\n") and current_reply:
-                current_reply = current_reply + "\n"
-            current_reply = current_reply + more
-            temp_ui[-1][1] = current_reply
-            temp_msgs.append({"role": "assistant", "content": more})
+        if not refine_flag:
+            for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
+                if not should_auto_continue(current_reply):
+                    break
+                msgs_continue = build_messages_for_continue(
+                    temp_msgs,
+                    temp_ui,
+                    use_rag_flag,
+                    mem_en_flag,
+                    mem_obj,
+                )
+                more = _sample_reply(msgs_continue, temp_ui)
+                if not more or violates_rules(more) or not more.strip():
+                    break
+                if len(more.strip()) < 6 and len(current_reply.strip()) > MIN_REPLY_CHARS:
+                    break
+                if not current_reply.endswith("\n") and current_reply:
+                    current_reply = current_reply + "\n"
+                current_reply = current_reply + more
+                temp_ui[-1][1] = current_reply
+                temp_msgs.append({"role": "assistant", "content": more})
 
-        reply = temp_ui[-1][1]
+            reply = temp_ui[-1][1]
+        else:
+            reply = temp_ui[-1][1]
         ui_hist = temp_ui
         msg_hist = temp_msgs
         if len(msg_hist) > 13:
@@ -849,8 +921,8 @@ with gr.Blocks(title="yuuka-ai") as demo:
         _send,
         inputs=[txt, chat, state_msgs, state_mem,
                 use_rag, mem_enabled,
-                temperature, top_p, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new],
+                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                diverse, k_candidates, max_new, refine_enabled],
         outputs=[chat, state_msgs, state_mem]
     ).then(lambda: "", None, txt)
 
@@ -858,15 +930,15 @@ with gr.Blocks(title="yuuka-ai") as demo:
         _send,
         inputs=[txt, chat, state_msgs, state_mem,
                 use_rag, mem_enabled,
-                temperature, top_p, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new],
+                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                diverse, k_candidates, max_new, refine_enabled],
         outputs=[chat, state_msgs, state_mem]
     ).then(lambda: "", None, txt)
 
     # === 继续说（智能续写；不显示“继续”的用户消息；直接拼到上一条助手回复） ===
     def _continue(ui_hist, msg_hist, mem_obj,
                   use_rag_flag, mem_en_flag,
-                  temp, topp, rep_pen, ngram, diverse_flag, k_cand, max_tokens):
+                  temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
 
         if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
             return ui_hist, msg_hist, mem_obj
@@ -882,6 +954,7 @@ with gr.Blocks(title="yuuka-ai") as demo:
             max_new_tokens=max_new,
             temperature=float(temp),
             top_p=float(topp),
+            typical_p=float(typical_val),
             repetition_penalty=float(rep_pen),
             no_repeat_ngram_size=int(ngram),
             length_penalty=DEFAULT_LENGTH_PENALTY,
@@ -893,6 +966,9 @@ with gr.Blocks(title="yuuka-ai") as demo:
                 more = generate_one(msgs, **gen_kwargs)
         else:
             more = generate_one(msgs, **gen_kwargs)
+
+        if refine_flag:
+            more = refine_short(more, tokenizer, model)
 
         # 1) UI：把新内容接到上一条助手消息上
         prev_u, prev_a = ui_hist[-1]
@@ -921,8 +997,8 @@ with gr.Blocks(title="yuuka-ai") as demo:
         _continue,
         inputs=[chat, state_msgs, state_mem,
                 use_rag, mem_enabled,
-                temperature, top_p, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new],
+                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                diverse, k_candidates, max_new, refine_enabled],
         outputs=[chat, state_msgs, state_mem]
     )
 
