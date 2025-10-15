@@ -7,14 +7,16 @@
 2) 统一角色：'user'/'老师' → '用户'；'assistant'/'优香' → '优香'。
 3) 默认使用“滑动窗口切片”产样：凡是以“优香”作结且前面至少有一条“用户”，都会产一条样本（受 min/max-turn 约束）。
    - 如需旧行为（只取每段对话的最后一问一答），将 --window-mode 设为 last。
-4) 继续支持：Persona 注入、记忆库提示、中文比例过滤、验证集切分，并打印统计信息便于排错。
+4) 默认限制上下文为最近4句，并确保紧邻优香回答的发言来自“用户”。
+5) 过滤无意义问答（如只有语气词/标点的回复或“？”式提问）。
+6) 继续支持：Persona 注入、记忆库提示、中文比例过滤、验证集切分，并打印统计信息便于排错。
 
 用法示例：
 python preprocess_data.py \
   --input "data/yuuka_dialogues_zh.jsonl" \
   --train-output "data/processed/train.jsonl" \
   --val-output "data/processed/val.jsonl" \
-  --val-ratio 0.08 --seed 42 --min-turn 3 --max-turn 6 \
+  --val-ratio 0.08 --seed 42 --min-turn 2 --max-turn 5 \
   --persona-prob 0.35 --merge-prev-prob 0.0 --emotion-prob 0.0 \
   --min-completion-zh-ratio 0.55 \
   --memory-file "kb/hard_memory.jsonl" \
@@ -36,6 +38,33 @@ def detect_chinese_ratio(text: str) -> float:
     total = len(text)
     zh = len(re.findall(r"[\u4e00-\u9fff]", text))
     return zh / max(total, 1)
+
+
+MEANINGLESS_COMPLETION_PATTERN = re.compile(r"^[啊哈嗯噢哦唔呀哎呜唉…\.\!\?！？。\s]+$")
+
+
+def is_meaningful_completion(text: str) -> bool:
+    """过滤只有语气词/标点的无意义回复。"""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return False
+    if MEANINGLESS_COMPLETION_PATTERN.match(stripped):
+        return False
+    return True
+
+
+def is_meaningful_user_query(text: str) -> bool:
+    """过滤缺乏实际信息的用户提问。"""
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < 2:
+        return False
+    if re.fullmatch(r"[?？…\.\!！]+", stripped):
+        return False
+    return True
 
 def save_jsonl(path: Path, items: List[Any]):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,14 +304,23 @@ def build_samples(
                 continue
             if not any(t["speaker"] == "用户" for t in seg[:-1]):
                 continue
+            if len(seg) < 2 or seg[-2]["speaker"] != "用户":
+                # 最后一轮优香发言前必须是用户提问
+                continue
+
+            last_user_text = seg[-2]["text"]
+            if not is_meaningful_user_query(last_user_text):
+                continue
+
+            completion_text = seg[-1]["text"]
+            if not is_meaningful_completion(completion_text):
+                continue
 
             # 构建 prompt/completion
             prompt_lines: List[str] = []
             for t in seg[:-1]:
                 prompt_lines.append(f"{t['speaker']}：{t['text']}")
             prompt_base = "\n".join(prompt_lines) + "\n优香："
-
-            completion_text = seg[-1]["text"]
 
             # 可选：并入上一句优香
             if merge_prev_prob > 0 and rng.random() < merge_prev_prob:
@@ -292,10 +330,6 @@ def build_samples(
                         completion_text = prev_ans.rstrip("\n") + "\n" + completion_text
 
             # 预算/报销提醒：若最后一条“用户”中包含关键词
-            last_user_text = ""
-            for t in reversed(seg[:-1]):
-                if t["speaker"] == "用户":
-                    last_user_text = t["text"]; break
             if re.search(r"预算|报销", last_user_text):
                 reminder = "请先盘点再给建议。"
                 if not completion_text.startswith(reminder):
@@ -330,8 +364,8 @@ def parse_args():
     p.add_argument("--val-ratio", type=float, default=0.08)
     p.add_argument("--seed", type=int, default=42)
 
-    p.add_argument("--min-turn", type=int, default=3, help="片段最少发言轮数（含最终优香回答）")
-    p.add_argument("--max-turn", type=int, default=6, help="片段最大发言轮数")
+    p.add_argument("--min-turn", type=int, default=2, help="片段最少发言轮数（含最终优香回答）")
+    p.add_argument("--max-turn", type=int, default=5, help="片段最大发言轮数（含最多4句上下文）")
     p.add_argument("--window-mode", choices=["sliding", "last"], default="sliding",
                    help="sliding：所有以优香作结的片段都产样；last：只取每段最后一个优香回答")
     p.add_argument("--persona-prob", type=float, default=0.35)
