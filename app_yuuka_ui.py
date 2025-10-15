@@ -79,8 +79,8 @@ PERSONA_ITEMS = [
 
 PERSONA_STYLE_KEYWORDS = ["老师", "预算", "盘点", "纠偏", "唔", "哼"]
 
-MAX_PERSONA_LINES = 9
-MIN_PERSONA_LINES = 6
+MAX_PERSONA_LINES = 7
+MIN_PERSONA_LINES = 5
 ACCOUNTING_KEYWORDS = {"收据", "发票", "预算", "金额", "价", "购物", "报销", "支出", "欠款", "超支", "账单"}
 ACCOUNTING_ALERT = "（注意：当前出现财务关键词，请切换【会计模式】，按先盘点→列问题→给补救→定约束说明。）"
 
@@ -93,12 +93,61 @@ ENTITY_SYNONYMS = {
     "文件": {"文书", "报告"},
 }
 
+RAG_STOPWORDS = {"老师", "teacher", "sensei"}
+SMALL_TALK_KEYWORDS = {
+    "你好", "您好", "嗨", "哈喽", "hello", "hi", "在吗", "在么", "晚安", "早安",
+    "早上好", "上午好", "中午好", "下午好", "晚上好", "最近好吗", "最近怎么样", "吃饭了吗",
+    "干嘛呢", "聊聊", "聊聊天", "待会见", "回来了", "拜拜", "再见", "辛苦了", "辛苦啦",
+}
+
 # =============== 分词 / 匹配辅助 ===============
 def _tokenize_for_match(text: str) -> Set[str]:
     toks = {w.strip() for w in jieba.cut(text) if w.strip()}
     for tok in list(toks):
         toks.update(ENTITY_SYNONYMS.get(tok, set()))
     return toks
+
+
+def _normalize_for_small_talk(text: str) -> str:
+    t = text.lower()
+    t = re.sub(r"[^a-z一-鿿]+", "", t)
+    return t
+
+
+def is_small_talk(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    normalized = _normalize_for_small_talk(stripped)
+    if not normalized:
+        return False
+    if len(normalized) <= 6 and any(kw in normalized for kw in SMALL_TALK_KEYWORDS):
+        return True
+    if len(normalized) <= 10:
+        for kw in SMALL_TALK_KEYWORDS:
+            if normalized.endswith(kw) or normalized.startswith(kw):
+                return True
+    return False
+
+
+def filter_rag_hits(hits: List[str], query: str) -> List[str]:
+    if not hits:
+        return []
+    if is_small_talk(query):
+        return []
+    normalized_query = _normalize_for_small_talk(query or "")
+    if len(normalized_query) <= 4:
+        return []
+    tokens = {tok for tok in _tokenize_for_match(query or "") if tok not in RAG_STOPWORDS}
+    if not tokens:
+        return []
+    filtered = []
+    for text in hits:
+        if any(tok in text for tok in tokens):
+            filtered.append(text)
+    if filtered:
+        return filtered
+    return []
 
 def select_persona_lines(user_text: str, max_lines: int = MAX_PERSONA_LINES) -> List[str]:
     tokens = _tokenize_for_match(user_text)
@@ -210,14 +259,18 @@ class HardMemory:
             if ent:
                 self.by_entity.setdefault(ent, []).append(it)
 
-    def retrieve_by_entity(self, query: str, topk: int = 6, min_score: float = 3.5) -> List[str]:
+    def retrieve_by_entity(self, query: str, topk: int = 6, min_score: float = 3.8) -> List[str]:
         if not self.by_entity:
             return []
         q = (query or "").strip()
-        toks = _tokenize_for_match(q)
+        if is_small_talk(q):
+            return []
+        toks = {tok for tok in _tokenize_for_match(q) if tok not in RAG_STOPWORDS}
         hits: List[Tuple[float, str]] = []
 
         for ent, items in self.by_entity.items():
+            if ent in RAG_STOPWORDS:
+                continue
             score = 0.0
             ent_syn = ENTITY_SYNONYMS.get(ent, set())
             if ent and ent in q:
@@ -252,12 +305,14 @@ class HardMemory:
             unique.append(text)
             if len(unique) >= topk:
                 break
-        return unique
+        return filter_rag_hits(unique, q)
 
-    def retrieve_bm25(self, query: str, topk: int = 4, min_rel: float = 0.65) -> List[str]:
+    def retrieve_bm25(self, query: str, topk: int = 4, min_rel: float = 0.8, min_abs: float = 1.6) -> List[str]:
         if not self.bm25:
             return []
-        base_tokens = [w for w in jieba.cut(query) if w.strip()]
+        if is_small_talk(query):
+            return []
+        base_tokens = [w for w in jieba.cut(query) if w.strip() and w.strip() not in RAG_STOPWORDS]
         expanded = list(base_tokens)
         for tok in base_tokens:
             expanded.extend(ENTITY_SYNONYMS.get(tok, set()))
@@ -270,12 +325,14 @@ class HardMemory:
         top_score = scores[idxs[0]] if scores.size else 0
         for i in idxs:
             sc = scores[i]
+            if sc < min_abs:
+                continue
             if top_score > 0 and sc < top_score * min_rel:
                 continue
             outs.append("· " + self.docs[i])
             if len(outs) >= topk:
                 break
-        return outs
+        return filter_rag_hits(outs, query)
 
 # =============== 会话记忆持久化 ===============
 def mem_path(mem_id: str) -> Path:
@@ -692,7 +749,8 @@ def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
 
     # 动态命中（entity）+ 兜底 BM25
     rag_dynamic = []
-    if use_rag:
+    effective_use_rag = use_rag and not is_small_talk(user_text)
+    if effective_use_rag:
         rag_dynamic.extend(hard_mem.retrieve_by_entity(user_text, topk=4))
         if not rag_dynamic:
             rag_dynamic.extend(hard_mem.retrieve_bm25(user_text, topk=3))
@@ -743,8 +801,9 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
             break
     persona_text = build_persona_block(last_user or (ui_hist[-1][0] if ui_hist else ""))
     rag_dynamic = []
-    if use_rag:
-        q = last_user if last_user else (ui_hist[-1][0] if ui_hist else "")
+    q = last_user if last_user else (ui_hist[-1][0] if ui_hist else "")
+    effective_use_rag = use_rag and not is_small_talk(q)
+    if effective_use_rag:
         rag_dynamic.extend(hard_mem.retrieve_by_entity(q, topk=4))
         if not rag_dynamic:
             rag_dynamic.extend(hard_mem.retrieve_bm25(q, topk=3))
