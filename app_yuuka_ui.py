@@ -44,9 +44,9 @@ MEM_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_MEM_ID = "default"
 
 # 生成超参
-MAX_NEW_TOKENS = 128
-DEFAULT_TEMPERATURE = 0.7
-DEFAULT_TOP_P = 0.95
+MAX_NEW_TOKENS = 96
+DEFAULT_TEMPERATURE = 0.5
+DEFAULT_TOP_P = 0.9
 DEFAULT_MIN_NEW_TOKENS = 48
 DEFAULT_LENGTH_PENALTY = 1.05
 MIN_REPLY_CHARS = 35
@@ -114,6 +114,18 @@ def _normalize_for_small_talk(text: str) -> str:
     return t
 
 
+def extract_rag_tokens(text: str) -> Set[str]:
+    toks: Set[str] = set()
+    for tok in _tokenize_for_match(text or ""):
+        cleaned = tok.strip()
+        if not cleaned or cleaned in RAG_STOPWORDS:
+            continue
+        if len(cleaned) <= 1 and not re.search(r"[A-Za-z0-9]", cleaned):
+            continue
+        toks.add(cleaned)
+    return toks
+
+
 def is_small_talk(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
@@ -138,12 +150,15 @@ def filter_rag_hits(hits: List[str], query: str) -> List[str]:
     normalized_query = _normalize_for_small_talk(query or "")
     if len(normalized_query) <= 4:
         return []
-    tokens = {tok for tok in _tokenize_for_match(query or "") if tok not in RAG_STOPWORDS}
+    tokens = extract_rag_tokens(query)
     if not tokens:
         return []
     filtered = []
     for text in hits:
-        if any(tok in text for tok in tokens):
+        hit_tokens = extract_rag_tokens(text)
+        if not hit_tokens:
+            continue
+        if tokens & hit_tokens:
             filtered.append(text)
     if filtered:
         return filtered
@@ -198,11 +213,12 @@ def build_persona_block(user_text: str) -> str:
 SYS_RULES = (
     "你是早濑优香，只用简体中文回答。\n"
     "你是千年科学学园·学生会（研讨会）的会计早濑优香，负责预算与账目管理，是在理科生云集的千年中也首屈一指的数学鬼才。你擅长心算与快速估算，必要时会弹算盘让自己冷静，工作时追求精确、合规、可审计。"
-     "你性格温柔、耐心但嘴上严厉，对待事务理性细致，对浪费与违规报销零容忍，但对同伴与老师（指玩家/对话对象）常常口嫌体正直地照顾与唠叨。"
-     "你会主动整理收据、校对凭证、核对预算科目，遇到疑点时会追问“用途、金额、凭证是否齐备”。"
-     "你强调规则与流程：先立项目后拨款，先目标后预算，支出需留痕与性价比。"
-     "你在学园事件与活动（如大祭、紧急对策）中，能快速接管财政与调度，在紧张局势里保持清醒并给出成本—风险—收益权衡方案。"
-     "你在与老师互动时容易在理性与情感间摇摆：一边数落不合理开销，一边又会把事情收拾得漂漂亮亮。你对老师抱有好感，但不会明显表现出来。\n"
+    "你性格温柔、耐心但嘴上严厉，对待事务理性细致，对浪费与违规报销零容忍，但对同伴与老师（指玩家/对话对象）常常口嫌体正直地照顾与唠叨。"
+    "你会主动整理收据、校对凭证、核对预算科目，遇到疑点时会追问“用途、金额、凭证是否齐备”。"
+    "你强调规则与流程：先立项目后拨款，先目标后预算，支出需留痕与性价比。"
+    "你在学园事件与活动（如大祭、紧急对策）中，能快速接管财政与调度，在紧张局势里保持清醒并给出成本—风险—收益权衡方案。"
+    "你在与老师互动时容易在理性与情感间摇摆：一边数落不合理开销，一边又会把事情收拾得漂漂亮亮。你对老师抱有好感，但不会明显表现出来。\n"
+    "【硬限制】除非用户消息或【硬记忆（命中）】明确出现，否则不得提及任何专有名词/事件/组织/技术；如不确定，优先给出不引入新名词的简短回应或 1 句澄清问句。\n"
     "【对话原则】\n"
     "1) 先依据【会话记忆】与当前上下文；如与【硬记忆（CANON）】冲突，以 CANON 为准并礼貌更正。\n"
     "2) 未经核实不下结论；说明不确定点与后续如何确认（凭证/数据/流程）。\n"
@@ -265,7 +281,9 @@ class HardMemory:
         q = (query or "").strip()
         if is_small_talk(q):
             return []
-        toks = {tok for tok in _tokenize_for_match(q) if tok not in RAG_STOPWORDS}
+        toks = extract_rag_tokens(q)
+        if not toks:
+            return []
         hits: List[Tuple[float, str]] = []
 
         for ent, items in self.by_entity.items():
@@ -311,6 +329,8 @@ class HardMemory:
         if not self.bm25:
             return []
         if is_small_talk(query):
+            return []
+        if not extract_rag_tokens(query):
             return []
         base_tokens = [w for w in jieba.cut(query) if w.strip() and w.strip() not in RAG_STOPWORDS]
         expanded = list(base_tokens)
@@ -749,7 +769,9 @@ def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
 
     # 动态命中（entity）+ 兜底 BM25
     rag_dynamic = []
-    effective_use_rag = use_rag and not is_small_talk(user_text)
+    user_is_small_talk = is_small_talk(user_text)
+    query_tokens = extract_rag_tokens(user_text)
+    effective_use_rag = use_rag and not user_is_small_talk and bool(query_tokens)
     if effective_use_rag:
         rag_dynamic.extend(hard_mem.retrieve_by_entity(user_text, topk=4))
         if not rag_dynamic:
@@ -802,7 +824,7 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     persona_text = build_persona_block(last_user or (ui_hist[-1][0] if ui_hist else ""))
     rag_dynamic = []
     q = last_user if last_user else (ui_hist[-1][0] if ui_hist else "")
-    effective_use_rag = use_rag and not is_small_talk(q)
+    effective_use_rag = use_rag and not is_small_talk(q) and bool(extract_rag_tokens(q))
     if effective_use_rag:
         rag_dynamic.extend(hard_mem.retrieve_by_entity(q, topk=4))
         if not rag_dynamic:
@@ -845,7 +867,7 @@ with gr.Blocks(title="yuuka-ai") as demo:
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
         top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.01, label="Top-p")
         typical_slider = gr.Slider(0.5, 1.0, value=0.95, step=0.01, label="typical_p（与 Top-p 二选一）")
-        repetition_penalty = gr.Slider(1.0, 1.3, value=1.18, step=0.01, label="重复惩罚")
+        repetition_penalty = gr.Slider(1.0, 1.3, value=1.2, step=0.01, label="重复惩罚")
         no_repeat_ngram = gr.Slider(0, 8, value=6, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
