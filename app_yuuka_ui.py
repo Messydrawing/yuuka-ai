@@ -36,7 +36,7 @@ OFFLOAD_DIR.mkdir(exist_ok=True, parents=True)
 
 # ✅ 改为 Qwen2.5-Instruct（本地目录或 Hub 名）
 BASE_MODEL = "models/Qwen2.5-7B-Instruct"      # 例如 "Qwen/Qwen2.5-7B-Instruct"
-LORA_DIR   = "models/yuuka_qwen-lora3"         # 你的 LoRA 输出目录
+LORA_DIR   = "models/yuuka_qwen-lora4"         # 你的 LoRA 输出目录
 HARD_MEM_PATH = "kb/hard_memory.jsonl"
 
 MEM_DIR = Path("memory")
