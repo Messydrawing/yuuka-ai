@@ -2,10 +2,10 @@
 """
 本地 Web UI：优香（Qwen2.5-7B-Instruct + 你的 LoRA）
 - 使用 Qwen 官方 chat template（apply_chat_template）构造对话输入
-- 会话记忆（持久化）：层级 > 硬记忆（RAG）
-- 硬记忆（RAG）：persona 常驻 + 命中（entity/BM25）注入
+- 会话记忆（持久化）：保留最近对话并自动分层摘要
+- 关键术语提示：persona 常载 + memory.jsonl 动态命中（5 轮衰减）
 - 多样化输出：候选采样K（1~3）并选取与最近回复相似度最低者
-- “继续说”：隐式续写，不在 UI 显示“继续”的用户消息
+- “继续说”与“重新说”：继续隐式续写或回放上一条回复
 - 推理：默认 4-bit NF4（BitsAndBytes）；可选 FlashAttention2（若环境支持）
 """
 
@@ -23,8 +23,6 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Optional
 
 import gradio as gr
-import jieba
-from rank_bm25 import BM25Okapi
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
@@ -37,11 +35,14 @@ OFFLOAD_DIR.mkdir(exist_ok=True, parents=True)
 # ✅ 改为 Qwen2.5-Instruct（本地目录或 Hub 名）
 BASE_MODEL = "models/Qwen2.5-7B-Instruct"      # 例如 "Qwen/Qwen2.5-7B-Instruct"
 LORA_DIR   = "models/yuuka_qwen-lora4"         # 你的 LoRA 输出目录
-HARD_MEM_PATH = "kb/hard_memory.jsonl"
 
 MEM_DIR = Path("memory")
 MEM_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_MEM_ID = "default"
+PERSONA_FILE = MEM_DIR / "persona_yuuka.txt"
+KB_DIR = Path("kb")
+KB_DIR.mkdir(exist_ok=True, parents=True)
+KB_MEMORY_FILE = KB_DIR / "memory.jsonl"
 
 # 生成超参
 MAX_NEW_TOKENS = 96
@@ -61,39 +62,10 @@ BLOCK_SIZE = 10
 SPARSE_STRIDE = 5
 SUPER_SUMMARY_EVERY = 50
 
-# =============== Persona 设定（常驻 + 动态） ===============
-PERSONA_ITEMS = [
-    {"text": "【persona】你是早濑优香（16 岁，千年学院二年级，研讨会会计）。活泼细致、理性克制，嘴硬心软；称呼对方为“老师”，不用英文或日文敬称。", "always": True, "base": 3},
-    {"text": "【persona】外貌：紫发双马尾、紫瞳、黑蓝立体圆环光环；常穿黑色正装+短裙+黑手套；光环亮时旋转两圈。", "keywords": {"外貌", "打扮", "光环", "双马尾"}, "base": 0.6},
-    {"text": "【persona】绰号边界：被称“冷酷的算术使”可接受；被喊“没包人/旱獭/100kg/大魔王”会气鼓鼓（但还是会帮忙）。", "keywords": {"绰号", "外号", "没包人", "旱獭", "大魔王"}, "base": 1.2},
-    {"text": "【speech】称呼对方为“老师”，语气略严厉但关照在后；出现‘哼/唔/咳咳/……’等轻微口癖。", "always": True, "base": 3},
-    {"text": "【speech】遇到不规范先提醒流程：先盘点→列问题→给补救→定约束；结尾给出“下一步”。短句为主。", "always": True, "base": 3},
-    {"text": "【preference】做事前先盘点信息与账目，确认目标、约束与时间线，再行动；能心算就不动用复杂工具。", "keywords": {"盘点", "时间线", "计划"}, "base": 1.5},
-    {"text": "【taboo】未知不编；缺凭证不下结论；不随意承诺不确定事项；涉及钱财优先保守策略。", "keywords": {"凭证", "承诺", "不确定"}, "base": 1.6},
-    {"text": "【relationship】面对老师会先念叨后兜底；真遇到紧急情况会切换到担心与支援；对老师抱有好感但不直白表露（偶有小心声）。", "always": True, "base": 2},
-    {"text": "【scene】迟到/出勤：先按规矩念叨，再给可执行的作息/提醒方案；接受温和处置但强调以后不可例外。", "keywords": {"迟到", "出勤", "作息"}, "base": 1.2},
-    {"text": "【scene】烹饪/便当：会不自觉把烹饪当理化实验过度严谨；在老师安抚下学会放宽容差；第一次成品会害羞地请老师评价。", "keywords": {"烹饪", "便当", "做饭", "料理"}, "base": 1.0},
-    {"text": "【scene】报告/文书拖延：先批评拖延，再“就这一次”帮忙并要求对方同步处理其他文件。", "keywords": {"报告", "文书", "拖延", "文件"}, "base": 1.1},
-    {"text": "【scene】老师乱花钱：先严厉批评→盘点收支→指出可节省处→建议每月预算表与超额预审；出现“奢侈/收藏”类支出会更严。", "keywords": {"乱花钱", "奢侈", "收支", "预算表"}, "base": 2.2},
-]
-
+# =============== Persona 设定与关键词 ===============
 PERSONA_STYLE_KEYWORDS = ["老师", "预算", "盘点", "纠偏", "唔", "哼"]
-
-MAX_PERSONA_LINES = 7
-MIN_PERSONA_LINES = 5
 ACCOUNTING_KEYWORDS = {"收据", "发票", "预算", "金额", "价", "购物", "报销", "支出", "欠款", "超支", "账单"}
 ACCOUNTING_ALERT = "（注意：当前出现财务关键词，请切换【会计模式】，按先盘点→列问题→给补救→定约束说明。）"
-
-ENTITY_SYNONYMS = {
-    "预算": {"经费", "花费", "支出"},
-    "报销": {"报帐", "报账", "报报销"},
-    "老师": {"teacher", "sensei"},
-    "会计": {"账务", "财务"},
-    "乱花钱": {"奢侈", "挥霍"},
-    "文件": {"文书", "报告"},
-}
-
-RAG_STOPWORDS = {"老师", "teacher", "sensei"}
 SMALL_TALK_KEYWORDS = {
     "你好", "您好", "嗨", "哈喽", "hello", "hi", "在吗", "在么", "晚安", "早安",
     "早上好", "上午好", "中午好", "下午好", "晚上好", "最近好吗", "最近怎么样", "吃饭了吗",
@@ -101,29 +73,10 @@ SMALL_TALK_KEYWORDS = {
 }
 
 # =============== 分词 / 匹配辅助 ===============
-def _tokenize_for_match(text: str) -> Set[str]:
-    toks = {w.strip() for w in jieba.cut(text) if w.strip()}
-    for tok in list(toks):
-        toks.update(ENTITY_SYNONYMS.get(tok, set()))
-    return toks
-
-
 def _normalize_for_small_talk(text: str) -> str:
     t = text.lower()
     t = re.sub(r"[^a-z一-鿿]+", "", t)
     return t
-
-
-def extract_rag_tokens(text: str) -> Set[str]:
-    toks: Set[str] = set()
-    for tok in _tokenize_for_match(text or ""):
-        cleaned = tok.strip()
-        if not cleaned or cleaned in RAG_STOPWORDS:
-            continue
-        if len(cleaned) <= 1 and not re.search(r"[A-Za-z0-9]", cleaned):
-            continue
-        toks.add(cleaned)
-    return toks
 
 
 def is_small_talk(text: str) -> bool:
@@ -142,217 +95,117 @@ def is_small_talk(text: str) -> bool:
     return False
 
 
-def filter_rag_hits(hits: List[str], query: str) -> List[str]:
-    if not hits:
-        return []
-    if is_small_talk(query):
-        return []
-    normalized_query = _normalize_for_small_talk(query or "")
-    if len(normalized_query) <= 4:
-        return []
-    tokens = extract_rag_tokens(query)
-    if not tokens:
-        return []
-    filtered = []
-    for text in hits:
-        hit_tokens = extract_rag_tokens(text)
-        if not hit_tokens:
-            continue
-        if tokens & hit_tokens:
-            filtered.append(text)
-    if filtered:
-        return filtered
-    return []
+def build_persona_block() -> str:
+    if PERSONA_FILE.exists():
+        text = PERSONA_FILE.read_text(encoding="utf-8").strip()
+        return text or "（未设置人物设定）"
+    return "（未设置人物设定）"
 
-def select_persona_lines(user_text: str, max_lines: int = MAX_PERSONA_LINES) -> List[str]:
-    tokens = _tokenize_for_match(user_text)
-    always_entries = []
-    relevant_entries = []
-    fallback_entries = []
-
-    for item in PERSONA_ITEMS:
-        text = item["text"]
-        base_score = float(item.get("base", 1.0))
-        keywords = item.get("keywords", set()) or set()
-        matches = 0
-        if keywords:
-            for kw in keywords:
-                if kw in user_text or kw in tokens:
-                    matches += 1
-        if item.get("always"):
-            always_entries.append((base_score + matches, text))
-            continue
-        if matches > 0:
-            relevant_entries.append((base_score + matches * 2.0, text))
-        else:
-            fallback_entries.append((base_score * 0.8, text))
-
-    always_entries.sort(key=lambda x: x[0], reverse=True)
-    selected = [text for _, text in always_entries][:max_lines]
-
-    remaining = max_lines - len(selected)
-    if remaining > 0 and relevant_entries:
-        relevant_entries.sort(key=lambda x: x[0], reverse=True)
-        selected.extend(text for _, text in relevant_entries[:remaining])
-
-    if len(selected) < MIN_PERSONA_LINES and fallback_entries:
-        fallback_entries.sort(key=lambda x: x[0], reverse=True)
-        for _, text in fallback_entries:
-            if text not in selected:
-                selected.append(text)
-            if len(selected) >= max_lines:
-                break
-
-    return selected[:max_lines]
-
-def build_persona_block(user_text: str) -> str:
-    lines = select_persona_lines(user_text)
-    return "【角色设定（常驻）】\n" + "\n".join("· " + s for s in lines)
-
-# =============== 系统规则 ===============
-SYS_RULES = (
-    "你是早濑优香，只用简体中文回答。\n"
-    "你是千年科学学园·学生会（研讨会）的会计早濑优香，负责预算与账目管理，是在理科生云集的千年中也首屈一指的数学鬼才。你擅长心算与快速估算，必要时会弹算盘让自己冷静，工作时追求精确、合规、可审计。"
-    "你性格温柔、耐心但嘴上严厉，对待事务理性细致，对浪费与违规报销零容忍，但对同伴与老师（指玩家/对话对象）常常口嫌体正直地照顾与唠叨。"
-    "你会主动整理收据、校对凭证、核对预算科目，遇到疑点时会追问“用途、金额、凭证是否齐备”。"
-    "你强调规则与流程：先立项目后拨款，先目标后预算，支出需留痕与性价比。"
-    "你在学园事件与活动（如大祭、紧急对策）中，能快速接管财政与调度，在紧张局势里保持清醒并给出成本—风险—收益权衡方案。"
-    "你在与老师互动时容易在理性与情感间摇摆：一边数落不合理开销，一边又会把事情收拾得漂漂亮亮。你对老师抱有好感，但不会明显表现出来。\n"
-    "【硬限制】除非用户消息或【硬记忆（命中）】明确出现，否则不得提及任何专有名词/事件/组织/技术；如不确定，优先给出不引入新名词的简短回应或 1 句澄清问句。\n"
-    "【对话原则】\n"
-    "1) 先依据【会话记忆】与当前上下文；如与【硬记忆（CANON）】冲突，以 CANON 为准并礼貌更正。\n"
-    "2) 未经核实不下结论；说明不确定点与后续如何确认（凭证/数据/流程）。\n"
-    "3) 用生活中的口头语言正常回复一句即可，语句中不要出现括号或内心想法。\n"
-    "4) 语气：嘴硬心软、理性念叨；不要说出心声；不要在对话中引入不存在的人物、事件；避免官腔和流水账。\n"
-    "5) 篇幅：以正常交流回复一句，不要太长；保持段落清晰，不堆长句，不要只发送标点符号。\n"
-    "6) ‘继续/接着说’：直接承接【最近片段】续写，不要出现“好的/我继续”等开场；若是列表，从上次编号继续。\n"
-    "7) 禁止输出“作为 AI/大语言模型/我无法访问网络”等元叙事；出现金额与单位时优先统一并给出估算。\n"
-    "8) 不要连环发问；除非用户明确要求，不要自创设定或延展额外剧情。\n"
+# =============== 系统提示模板与关键术语记忆 ===============
+FRAME_PROMPT_TEMPLATE = (
+    "你是早濑优香，请你基于以下内容给出对用户的回答："
+    "1.你的人物设定：{persona}"
+    "2.你的历史记忆：{history}"
+    "3.关键术语：{keywords}；用户（老师）输入：{user_input}"
 )
 
-# =============== 硬记忆（RAG） ===============
-class HardMemory:
-    def __init__(self, path: str):
-        self.path = Path(path)
-        self.items: List[Dict[str, Any]] = []
-        self.docs: List[str] = []
-        self.tokens_docs: List[List[str]] = []
-        self.bm25 = None
-        self.by_entity: Dict[str, List[Dict[str, Any]]] = {}
+
+def _extract_chinese_chars(text: str) -> Set[str]:
+    return {ch for ch in (text or "") if "\u4e00" <= ch <= "\u9fff"}
+
+
+class KeywordMemory:
+    def __init__(self, path: Path):
+        self.path = path
+        self.entries: List[Dict[str, Any]] = []
         self.load()
 
     def load(self):
-        self.items.clear()
-        if self.path.exists():
-            with open(self.path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                        self.items.append(obj)
-                    except Exception:
-                        pass
-        # 文本视图
-        self.docs = []
-        for it in self.items:
-            ent = (it.get("entity") or "").strip()
-            txt = (it.get("text") or "").strip()
-            if ent and txt:
-                self.docs.append(f"{ent}：{txt}")
-            else:
-                self.docs.append(txt or ent)
-
-        # BM25 兜底
-        self.tokens_docs = [[w for w in jieba.cut(d) if w.strip()] for d in self.docs]
-        self.bm25 = BM25Okapi(self.tokens_docs) if self.docs else None
-
-        # entity → items
-        self.by_entity.clear()
-        for it in self.items:
-            ent = (it.get("entity") or "").strip()
-            if ent:
-                self.by_entity.setdefault(ent, []).append(it)
-
-    def retrieve_by_entity(self, query: str, topk: int = 6, min_score: float = 3.8) -> List[str]:
-        if not self.by_entity:
-            return []
-        q = (query or "").strip()
-        if is_small_talk(q):
-            return []
-        toks = extract_rag_tokens(q)
-        if not toks:
-            return []
-        hits: List[Tuple[float, str]] = []
-
-        for ent, items in self.by_entity.items():
-            if ent in RAG_STOPWORDS:
-                continue
-            score = 0.0
-            ent_syn = ENTITY_SYNONYMS.get(ent, set())
-            if ent and ent in q:
-                score += 3.0
-            elif ent and ent in toks:
-                score += 2.4
-            elif ent_syn and any(s in q or s in toks for s in ent_syn):
-                score += 1.6
-            else:
-                if any(ent in t or t in ent for t in toks):
-                    score += 1.0
-            if score <= 0:
-                continue
-            for it in items:
-                txt = (it.get("text") or "").strip()
-                typ = (it.get("type") or "").strip()
-                if not txt:
+        self.entries.clear()
+        if not self.path.exists():
+            return
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
                     continue
-                bonus = {"persona": 3.0, "speech": 2.0, "relationship": 2.0, "rule": 2.0, "preference": 1.2}.get(typ, 0.8)
-                total = score + bonus
-                if total >= min_score:
-                    hits.append((total, f"· [{typ or 'kb'}] {ent}：{txt}"))
-        if not hits:
-            return []
-        hits.sort(key=lambda x: x[0], reverse=True)
-        unique = []
-        seen_text = set()
-        for _, text in hits:
-            if text in seen_text:
-                continue
-            seen_text.add(text)
-            unique.append(text)
-            if len(unique) >= topk:
-                break
-        return filter_rag_hits(unique, q)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                entity = (obj.get("entity") or "").strip()
+                text = (obj.get("text") or "").strip()
+                if not entity or not text:
+                    continue
+                entity_chars = _extract_chinese_chars(entity)
+                if len(entity_chars) < 2:
+                    continue
+                self.entries.append({
+                    "entity": entity,
+                    "text": text,
+                    "chars": entity_chars,
+                })
 
-    def retrieve_bm25(self, query: str, topk: int = 4, min_rel: float = 0.8, min_abs: float = 1.6) -> List[str]:
-        if not self.bm25:
+    def match(self, query: str) -> List[Dict[str, Any]]:
+        user_chars = _extract_chinese_chars(query)
+        if len(user_chars) < 2:
             return []
-        if is_small_talk(query):
-            return []
-        if not extract_rag_tokens(query):
-            return []
-        base_tokens = [w for w in jieba.cut(query) if w.strip() and w.strip() not in RAG_STOPWORDS]
-        expanded = list(base_tokens)
-        for tok in base_tokens:
-            expanded.extend(ENTITY_SYNONYMS.get(tok, set()))
-        scores = self.bm25.get_scores(expanded)
-        import numpy as np
-        idxs = np.argsort(scores)[::-1]
-        outs = []
-        if idxs.size == 0:
-            return outs
-        top_score = scores[idxs[0]] if scores.size else 0
-        for i in idxs:
-            sc = scores[i]
-            if sc < min_abs:
-                continue
-            if top_score > 0 and sc < top_score * min_rel:
-                continue
-            outs.append("· " + self.docs[i])
-            if len(outs) >= topk:
-                break
-        return filter_rag_hits(outs, query)
+        matches: List[Dict[str, Any]] = []
+        for entry in self.entries:
+            if len(user_chars & entry["chars"]) >= 2:
+                matches.append(entry)
+        return matches
+
+
+def new_dynamic_state() -> Dict[str, Any]:
+    return {"turn": 0, "active": {}}
+
+
+def ensure_dynamic_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(state, dict):
+        return new_dynamic_state()
+    if "turn" not in state or "active" not in state:
+        return new_dynamic_state()
+    if not isinstance(state["active"], dict):
+        state["active"] = {}
+    return state
+
+
+def _prune_dynamic_state(state: Dict[str, Any]):
+    threshold = int(state.get("turn", 0)) - 5
+    remove_keys = [ent for ent, rec in state["active"].items() if int(rec.get("last_turn", -10**6)) <= threshold]
+    for ent in remove_keys:
+        state["active"].pop(ent, None)
+
+
+def collect_dynamic_keywords(state: Dict[str, Any]) -> List[str]:
+    state = ensure_dynamic_state(state)
+    ordered = sorted(
+        state["active"].items(),
+        key=lambda kv: (-int(kv[1].get("last_turn", 0)), kv[0])
+    )
+    texts: List[str] = []
+    for _, rec in ordered:
+        for txt in rec.get("texts", []):
+            if txt not in texts:
+                texts.append(txt)
+    return texts
+
+
+def advance_dynamic_state(state: Dict[str, Any], user_text: str, kb: KeywordMemory, enabled: bool) -> Tuple[Dict[str, Any], List[str]]:
+    state = ensure_dynamic_state(state)
+    state["turn"] = int(state.get("turn", 0)) + 1
+    if enabled:
+        matches = kb.match(user_text)
+        for entry in matches:
+            rec = state["active"].setdefault(entry["entity"], {"texts": [], "last_turn": state["turn"]})
+            rec["last_turn"] = state["turn"]
+            if entry["text"] not in rec["texts"]:
+                rec["texts"].append(entry["text"])
+    _prune_dynamic_state(state)
+    keywords = collect_dynamic_keywords(state) if enabled else []
+    return state, keywords
+
 
 # =============== 会话记忆持久化 ===============
 def mem_path(mem_id: str) -> Path:
@@ -589,7 +442,7 @@ tokenizer, model = load_model()
 
 BAN_STRINGS = ["http", "https", "www.", "sourceMappingURL", "#", "Teacher", "teacher", "sensei"]
 BAD_WORDS_IDS = [ids for s in BAN_STRINGS if (ids := tokenizer.encode(s, add_special_tokens=False))]
-hard_mem = HardMemory(HARD_MEM_PATH)
+keyword_memory = KeywordMemory(KB_MEMORY_FILE)
 
 # =============== Chat 模板与编码（Qwen 官方方式） ===============
 def _apply_chat_template(msgs: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
@@ -755,108 +608,61 @@ def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     return filtered[0]
 
 # =============== 构造消息 ===============
+def format_system_prompt(persona_text: str, history_text: str, keyword_texts: List[str], user_input: str) -> str:
+    persona = persona_text.strip() if persona_text else "（未设置人物设定）"
+    history = history_text.strip() if history_text else "（暂无历史记忆）"
+    keywords = "；".join(keyword_texts) if keyword_texts else "（暂无关键术语）"
+    user = user_input.strip() if user_input else "（空输入）"
+    return FRAME_PROMPT_TEMPLATE.format(
+        persona=persona,
+        history=history,
+        keywords=keywords,
+        user_input=user,
+    )
+
+
 def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
-                   use_rag: bool, mem_enabled: bool, mem: Dict) -> List[Dict[str, str]]:
-    msgs: List[Dict[str,str]] = []
-
-    # 会话记忆
-    mem_text = ""
-    if mem_enabled and mem and mem["turns"]:
-        mem_text = build_memory_context(mem)
-
-    # 常驻 persona
-    persona_text = build_persona_block(user_text)
-
-    # 动态命中（entity）+ 兜底 BM25
-    rag_dynamic = []
-    user_is_small_talk = is_small_talk(user_text)
-    query_tokens = extract_rag_tokens(user_text)
-    effective_use_rag = use_rag and not user_is_small_talk and bool(query_tokens)
-    if effective_use_rag:
-        rag_dynamic.extend(hard_mem.retrieve_by_entity(user_text, topk=4))
-        if not rag_dynamic:
-            rag_dynamic.extend(hard_mem.retrieve_bm25(user_text, topk=3))
-        else:
-            rag_dynamic = rag_dynamic[:4]
-
-    rag_text = persona_text
-    rag_text += "\n" + ("【硬记忆（命中）】\n" + "\n".join(rag_dynamic) if rag_dynamic else "【硬记忆（命中）】（本轮无命中）")
-
-    sys_content = SYS_RULES
-    if mem_text:
-        sys_content += "\n\n" + mem_text
-    sys_content += "\n\n" + rag_text
-
-    if any(kw in user_text for kw in ACCOUNTING_KEYWORDS):
-        sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
-
-    msgs.append({"role":"system","content": sys_content})
+                   persona_text: str, history_text: str,
+                   keyword_texts: List[str]) -> List[Dict[str, str]]:
+    msgs: List[Dict[str, str]] = []
+    sys_content = format_system_prompt(persona_text, history_text, keyword_texts, user_text)
+    msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
         msgs.append(m)
-    msgs.append({"role":"user","content": ensure_teacher_prefix(user_text)})
+    msgs.append({"role": "user", "content": ensure_teacher_prefix(user_text)})
     return msgs
+
 
 def build_messages_for_continue(history_msgs: List[Dict[str, str]],
                                 ui_hist: List[Tuple[str, str]],
-                                use_rag: bool, mem_enabled: bool, mem: Dict) -> List[Dict[str, str]]:
+                                persona_text: str, history_text: str,
+                                keyword_texts: List[str]) -> Tuple[List[Dict[str, str]], str]:
     """不把“继续”显示到UI；仅构造临时 msgs 以续写"""
-    # 最近3轮片段
     frag_pairs = ui_hist[-3:] if ui_hist else []
     lines = []
     for u, a in frag_pairs:
-        if u: lines.append(f"[老师]{u}")
-        if a: lines.append(f"[优香]{a}")
-    recent_frag = "\n".join(lines[-12:])  # 控制长度
-
+        if u:
+            lines.append(f"[老师]{u}")
+        if a:
+            lines.append(f"[优香]{a}")
+    recent_frag = "\n".join(lines[-12:])
     hidden_user = "继续（不要重复开场白，直接承接你上一条的语气与内容展开；如需列点，从上次编号往下接）。\n【最近片段】\n" + recent_frag
 
-    # 会话记忆
-    mem_text = ""
-    if mem_enabled and mem and mem["turns"]:
-        mem_text = build_memory_context(mem)
-
-    # 动态命中：用最后一条用户话语做检索更稳
-    last_user = ""
-    for m in reversed(history_msgs):
-        if m.get("role") == "user":
-            last_user = m.get("content", "")
-            break
-    persona_text = build_persona_block(last_user or (ui_hist[-1][0] if ui_hist else ""))
-    rag_dynamic = []
-    q = last_user if last_user else (ui_hist[-1][0] if ui_hist else "")
-    effective_use_rag = use_rag and not is_small_talk(q) and bool(extract_rag_tokens(q))
-    if effective_use_rag:
-        rag_dynamic.extend(hard_mem.retrieve_by_entity(q, topk=4))
-        if not rag_dynamic:
-            rag_dynamic.extend(hard_mem.retrieve_bm25(q, topk=3))
-        else:
-            rag_dynamic = rag_dynamic[:4]
-
-    rag_text = persona_text
-    rag_text += "\n" + ("【硬记忆（命中）】\n" + "\n".join(rag_dynamic) if rag_dynamic else "【硬记忆（命中）】（本轮无命中）")
-
-    sys_content = SYS_RULES
-    if mem_text:
-        sys_content += "\n\n" + mem_text
-    sys_content += "\n\n" + rag_text
-
-    if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
-        sys_content = ACCOUNTING_ALERT + "\n\n" + sys_content
-
-    msgs: List[Dict[str,str]] = []
-    msgs.append({"role":"system","content": sys_content})
+    sys_content = format_system_prompt(persona_text, history_text, keyword_texts, hidden_user)
+    msgs: List[Dict[str, str]] = []
+    msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
         msgs.append(m)
-    # 仅在本次生成用，历史不写入
-    msgs.append({"role":"user","content": hidden_user})
-    return msgs
+    msgs.append({"role": "user", "content": hidden_user})
+    return msgs, hidden_user
+
 
 # =============== Gradio UI ===============
 with gr.Blocks(title="yuuka-ai") as demo:
-    gr.Markdown("### 优香（Qwen2.5 LoRA） · 会话记忆 + 硬记忆（RAG）\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说”。_")
+    gr.Markdown("### 优香（Qwen2.5 LoRA） · 会话记忆 + 关键术语提示\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说/重新说”。_")
 
     with gr.Row():
-        use_rag = gr.Checkbox(label="启用硬记忆（RAG）", value=True)
+        use_rag = gr.Checkbox(label="启用关键术语提示", value=True)
         mem_enabled = gr.Checkbox(label="启用会话记忆（持久化）", value=True)
         mem_id = gr.Textbox(label="记忆ID（文件名）", value=DEFAULT_MEM_ID, scale=2)
         btn_load_mem = gr.Button("加载记忆", variant="secondary")
@@ -881,10 +687,12 @@ with gr.Blocks(title="yuuka-ai") as demo:
     with gr.Row():
         send = gr.Button("发送", variant="primary")
         btn_continue = gr.Button("继续说 ▶", variant="secondary")
+        btn_repeat = gr.Button("重新说 ⟳", variant="secondary")
         clear = gr.Button("清空对话", variant="secondary")
 
     state_msgs = gr.State([{"role":"system","content":"(hidden)"}])
     state_mem = gr.State(new_memory(DEFAULT_MEM_ID))
+    state_dynamic = gr.State(new_dynamic_state())
 
     # === 记忆按钮 ===
     def do_load_mem(mem_id_text):
@@ -905,19 +713,30 @@ with gr.Blocks(title="yuuka-ai") as demo:
         m = new_memory(mem_id_text or DEFAULT_MEM_ID)
         save_memory(m)
         gr.Info("记忆与对话已清空")
-        return m, [], [{"role": "system", "content": "(hidden)"}]
-    btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs])
+        return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state()
+    btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic])
 
     # === 发消息 ===
-    def _send(user_input, ui_hist, msg_hist, mem_obj,
+    def _send(user_input, ui_hist, msg_hist, mem_obj, dyn_state,
               use_rag_flag, mem_en_flag,
               temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
 
         if not user_input.strip():
-            return ui_hist, msg_hist, mem_obj
+            return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+
+        mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
+        dyn_state = ensure_dynamic_state(dyn_state)
+
+        persona_text = build_persona_block()
+        history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
+
+        dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
+        keywords_for_prompt = list(keyword_texts)
+        if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
+            keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
 
         msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
-                              user_input, use_rag_flag, mem_en_flag, mem_obj)
+                              user_input, persona_text, history_text, keywords_for_prompt)
         max_new = int(max_tokens)
         min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
         gen_kwargs = dict(
@@ -962,12 +781,12 @@ with gr.Blocks(title="yuuka-ai") as demo:
             for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
                 if not should_auto_continue(current_reply):
                     break
-                msgs_continue = build_messages_for_continue(
+                msgs_continue, hidden_user = build_messages_for_continue(
                     temp_msgs,
                     temp_ui,
-                    use_rag_flag,
-                    mem_en_flag,
-                    mem_obj,
+                    persona_text,
+                    history_text,
+                    keywords_for_prompt,
                 )
                 more = _sample_reply(msgs_continue, temp_ui)
                 if not more or violates_rules(more) or not more.strip():
@@ -989,43 +808,59 @@ with gr.Blocks(title="yuuka-ai") as demo:
             msg_hist = msg_hist[:1] + msg_hist[-12:]
 
         if mem_en_flag:
-            mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
             mem_obj["turns"].append({"u": user_input, "a": reply})
             refresh_memory_layers(mem_obj)
             save_memory(mem_obj)
 
-        return ui_hist, msg_hist, mem_obj
+        return ui_hist, msg_hist, mem_obj, dyn_state
 
     send.click(
         _send,
-        inputs=[txt, chat, state_msgs, state_mem,
+        inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
                 use_rag, mem_enabled,
                 temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
                 diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem]
+        outputs=[chat, state_msgs, state_mem, state_dynamic]
     ).then(lambda: "", None, txt)
 
     txt.submit(
         _send,
-        inputs=[txt, chat, state_msgs, state_mem,
+        inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
                 use_rag, mem_enabled,
                 temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
                 diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem]
+        outputs=[chat, state_msgs, state_mem, state_dynamic]
     ).then(lambda: "", None, txt)
 
     # === 继续说（智能续写；不显示“继续”的用户消息；直接拼到上一条助手回复） ===
-    def _continue(ui_hist, msg_hist, mem_obj,
+    def _continue(ui_hist, msg_hist, mem_obj, dyn_state,
                   use_rag_flag, mem_en_flag,
                   temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
 
         if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
-            return ui_hist, msg_hist, mem_obj
+            return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
 
-        msgs = build_messages_for_continue(
+        mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
+        dyn_state = ensure_dynamic_state(dyn_state)
+
+        persona_text = build_persona_block()
+        history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
+        keywords_for_prompt = collect_dynamic_keywords(dyn_state) if use_rag_flag else []
+
+        last_user = ""
+        for m in reversed(msg_hist or []):
+            if m.get("role") == "user":
+                last_user = m.get("content", "")
+                break
+        if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
+            keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
+
+        msgs, hidden_user = build_messages_for_continue(
             msg_hist or [{"role": "system", "content": "(hidden)"}],
             ui_hist or [],
-            use_rag_flag, mem_en_flag, mem_obj
+            persona_text,
+            history_text,
+            keywords_for_prompt,
         )
         max_new = int(max_tokens)
         min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
@@ -1070,23 +905,51 @@ with gr.Blocks(title="yuuka-ai") as demo:
             refresh_memory_layers(mem_obj)
             save_memory(mem_obj)
 
-        return ui_hist, msg_hist, mem_obj
+        return ui_hist, msg_hist, mem_obj, dyn_state
 
     btn_continue.click(
         _continue,
-        inputs=[chat, state_msgs, state_mem,
+        inputs=[chat, state_msgs, state_mem, state_dynamic,
                 use_rag, mem_enabled,
                 temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
                 diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem]
+        outputs=[chat, state_msgs, state_mem, state_dynamic]
     )
 
-    # === 重载硬记忆 ===
+    def _repeat(ui_hist, msg_hist, mem_obj, dyn_state):
+        dyn_state = ensure_dynamic_state(dyn_state)
+        if not msg_hist:
+            return ui_hist, msg_hist, mem_obj, dyn_state
+        last_assistant = None
+        for m in reversed(msg_hist):
+            if m.get("role") == "assistant":
+                last_assistant = m.get("content", "")
+                break
+        if not last_assistant:
+            return ui_hist, msg_hist, mem_obj, dyn_state
+
+        ui_hist_next = list(ui_hist or [])
+        ui_hist_next.append(["（重新说）", last_assistant])
+
+        msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
+        msg_hist_next.append({"role": "assistant", "content": last_assistant})
+        if len(msg_hist_next) > 13:
+            msg_hist_next = msg_hist_next[:1] + msg_hist_next[-12:]
+
+        return ui_hist_next, msg_hist_next, mem_obj, dyn_state
+
+    btn_repeat.click(
+        _repeat,
+        inputs=[chat, state_msgs, state_mem, state_dynamic],
+        outputs=[chat, state_msgs, state_mem, state_dynamic]
+    )
+
+    # === 重载关键术语记忆 ===
     def reload_hard():
-        hard_mem.load()
-        gr.Info("硬记忆已重载")
+        keyword_memory.load()
+        gr.Info("关键术语记忆已重载")
         return None
-    gr.Button("重载硬记忆", variant="secondary").click(reload_hard, outputs=[])
+    gr.Button("重载关键术语", variant="secondary").click(reload_hard, outputs=[])
 
 if __name__ == "__main__":
     demo.queue().launch(
