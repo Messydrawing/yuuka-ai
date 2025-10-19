@@ -6,7 +6,7 @@
 - 关键术语提示：persona 常载 + memory.jsonl 动态命中（5 轮衰减）
 - 多样化输出：候选采样K（1~3）并选取与最近回复相似度最低者
 - “继续说”与“重新说”：继续隐式续写或回放上一条回复
-- 推理：默认 4-bit NF4（BitsAndBytes）；可选 FlashAttention2（若环境支持）
+- 推理：默认 4-bFit NF4（BitsAndBytes）；可选 lashAttention2（若环境支持）
 """
 
 import os
@@ -34,7 +34,7 @@ OFFLOAD_DIR.mkdir(exist_ok=True, parents=True)
 
 # ✅ 改为 Qwen2.5-Instruct（本地目录或 Hub 名）
 BASE_MODEL = "models/Qwen2.5-7B-Instruct"      # 例如 "Qwen/Qwen2.5-7B-Instruct"
-LORA_DIR   = "models/yuuka_qwen-lora4"         # 你的 LoRA 输出目录
+LORA_DIR   = "models/yuuka_qwen-lora8"         # 你的 LoRA 输出目录
 
 MEM_DIR = Path("memory")
 MEM_DIR.mkdir(exist_ok=True, parents=True)
@@ -42,7 +42,7 @@ DEFAULT_MEM_ID = "default"
 PERSONA_FILE = MEM_DIR / "persona_yuuka.txt"
 KB_DIR = Path("kb")
 KB_DIR.mkdir(exist_ok=True, parents=True)
-KB_MEMORY_FILE = KB_DIR / "memory.jsonl"
+KB_MEMORY_FILE = KB_DIR / "hard_memory.jsonl"
 
 # 生成超参
 MAX_NEW_TOKENS = 96
@@ -65,7 +65,7 @@ SUPER_SUMMARY_EVERY = 50
 # =============== Persona 设定与关键词 ===============
 PERSONA_STYLE_KEYWORDS = ["老师", "预算", "盘点", "纠偏", "唔", "哼"]
 ACCOUNTING_KEYWORDS = {"收据", "发票", "预算", "金额", "价", "购物", "报销", "支出", "欠款", "超支", "账单"}
-ACCOUNTING_ALERT = "（注意：当前出现财务关键词，请切换【会计模式】，按先盘点→列问题→给补救→定约束说明。）"
+ACCOUNTING_ALERT = "（注意：当前出现财务关键词，请从专业的角度给出分析。）"
 SMALL_TALK_KEYWORDS = {
     "你好", "您好", "嗨", "哈喽", "hello", "hi", "在吗", "在么", "晚安", "早安",
     "早上好", "上午好", "中午好", "下午好", "晚上好", "最近好吗", "最近怎么样", "吃饭了吗",
