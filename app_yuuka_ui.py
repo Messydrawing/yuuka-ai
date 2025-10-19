@@ -249,6 +249,19 @@ _URL_RE = re.compile(r"(https?://\S+|www\.\S+)")
 _TAG_RE = re.compile(r"(?:^|\s)#\S+")
 
 
+def extract_first_sentence(text: str) -> str:
+    if not text:
+        return text
+    stripped = text.strip()
+    if not stripped:
+        return stripped
+    for idx, ch in enumerate(stripped):
+        if ch in "。？！?!":
+            return stripped[:idx + 1].strip()
+    first_line = stripped.splitlines()[0].strip()
+    return first_line or stripped
+
+
 def _sanitize(text: str) -> str:
     if not text:
         return text
@@ -799,9 +812,19 @@ with gr.Blocks(title="yuuka-ai") as demo:
                 temp_ui[-1][1] = current_reply
                 temp_msgs.append({"role": "assistant", "content": more})
 
-            reply = temp_ui[-1][1]
-        else:
-            reply = temp_ui[-1][1]
+        full_reply = temp_ui[-1][1]
+        reply = extract_first_sentence(full_reply)
+        temp_ui[-1][1] = reply
+
+        last_user_idx = None
+        for idx in range(len(temp_msgs) - 1, -1, -1):
+            if temp_msgs[idx].get("role") == "user":
+                last_user_idx = idx
+                break
+        if last_user_idx is not None and last_user_idx + 1 < len(temp_msgs):
+            temp_msgs = temp_msgs[:last_user_idx + 2]
+            temp_msgs[-1]["content"] = reply
+
         ui_hist = temp_ui
         msg_hist = temp_msgs
         if len(msg_hist) > 13:
@@ -886,22 +909,26 @@ with gr.Blocks(title="yuuka-ai") as demo:
 
         # 1) UI：把新内容接到上一条助手消息上
         prev_u, prev_a = ui_hist[-1]
-        ui_hist[-1] = [prev_u, (prev_a + ("\n" if prev_a and not prev_a.endswith("\n") else "") + more)]
+        combined = prev_a + ("\n" if prev_a and not prev_a.endswith("\n") else "") + more
+        truncated = extract_first_sentence(combined)
+        ui_hist[-1] = [prev_u, truncated]
 
-        # 2) 历史消息：仅追加 assistant
-        msg_hist = (msg_hist or [{"role": "system", "content": "(hidden)"}]) + [
-            {"role": "assistant", "content": more},
-        ]
+        # 2) 历史消息：仅保留截断后的助手消息
+        msg_hist = msg_hist or [{"role": "system", "content": "(hidden)"}]
+        if msg_hist and msg_hist[-1].get("role") == "assistant":
+            msg_hist[-1]["content"] = truncated
         if len(msg_hist) > 13:
             msg_hist = msg_hist[:1] + msg_hist[-12:]
 
-        # 3) 会话记忆：把最后一轮的回复拼接续写内容
+        # 3) 会话记忆：保持仅存第一句
         if mem_en_flag:
             mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
             if mem_obj.get("turns"):
-                mem_obj["turns"][-1]["a"] = mem_obj["turns"][-1]["a"] + ("\n" if mem_obj["turns"][-1]["a"] else "") + more
+                existing = mem_obj["turns"][-1]["a"] or ""
+                combined_mem = existing + ("\n" if existing else "") + more
+                mem_obj["turns"][-1]["a"] = extract_first_sentence(combined_mem)
             else:
-                mem_obj["turns"].append({"u": "", "a": more})
+                mem_obj["turns"].append({"u": "", "a": extract_first_sentence(more)})
             refresh_memory_layers(mem_obj)
             save_memory(mem_obj)
 
