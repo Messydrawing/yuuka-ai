@@ -64,6 +64,7 @@ MEM_DIR = Path("memory")
 MEM_DIR.mkdir(exist_ok=True, parents=True)
 DEFAULT_MEM_ID = "default"
 PERSONA_FILE = MEM_DIR / "persona_yuuka.txt"
+LONG_TERM_MEMORY_FILE = MEM_DIR / "hard_memory_runtime.jsonl"
 KB_DIR = Path("kb")
 KB_DIR.mkdir(exist_ok=True, parents=True)
 KB_MEMORY_FILE = KB_DIR / "hard_memory.jsonl"
@@ -127,10 +128,11 @@ def build_persona_block() -> str:
 
 # =============== 系统提示模板与关键术语记忆 ===============
 FRAME_PROMPT_TEMPLATE = (
-    "你是早濑优香，请你基于以下内容给出对用户的回答："
-    "1.你的人物设定：{persona}"
-    "2.你的历史记忆：{history}"
-    "3.关键术语：{keywords}；用户（老师）输入：{user_input}"
+    "你是早濑优香，请你基于以下内容给出对用户的回答：\n"
+    "1.你的人物设定：{persona}\n"
+    "2.你的历史记忆：{history}\n"
+    "3.你的长期记忆：{long_term}\n"
+    "4.关键术语：{keywords}；用户（老师）输入：{user_input}"
 )
 
 
@@ -256,6 +258,229 @@ def load_memory(mem_id: str) -> Dict:
 def save_memory(mem: Dict):
     with open(mem_path(mem["id"]), "w", encoding="utf-8") as f:
         json.dump(mem, f, ensure_ascii=False, indent=2)
+
+
+# =============== 长期记忆（信息型） ===============
+_FACT_LABELS = {
+    "name": "姓名",
+    "alias": "别称",
+    "age": "年龄",
+    "birthday": "生日",
+    "interest": "兴趣",
+    "like": "喜好",
+    "dislike": "厌恶",
+    "location": "所在地",
+    "origin": "籍贯",
+    "profession": "职业",
+}
+
+
+def load_long_term_memory() -> List[Dict[str, Any]]:
+    records: List[Dict[str, Any]] = []
+    if not LONG_TERM_MEMORY_FILE.exists():
+        return records
+    with open(LONG_TERM_MEMORY_FILE, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = str(obj.get("key") or obj.get("type") or "fact").strip()
+            value = str(obj.get("value") or obj.get("text") or "").strip()
+            if not value:
+                continue
+            obj["key"] = key
+            obj["value"] = value
+            records.append(obj)
+    records.sort(key=lambda x: int(x.get("created_at", 0)))
+    return records
+
+
+def save_long_term_memory(records: List[Dict[str, Any]]):
+    LONG_TERM_MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(LONG_TERM_MEMORY_FILE, "w", encoding="utf-8") as f:
+        for rec in records:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def clear_long_term_memory():
+    if LONG_TERM_MEMORY_FILE.exists():
+        LONG_TERM_MEMORY_FILE.unlink()
+
+
+def export_long_term_memory() -> Optional[str]:
+    if LONG_TERM_MEMORY_FILE.exists() and LONG_TERM_MEMORY_FILE.stat().st_size > 0:
+        return str(LONG_TERM_MEMORY_FILE)
+    return None
+
+
+def _sanitize_fact_value(text: str) -> str:
+    if not text:
+        return ""
+    t = text.strip()
+    t = re.sub(r"^[：:的地得\-\s]+", "", t)
+    t = re.sub(r"[。！!？?,，；;、\s]+$", "", t)
+    return t.strip()
+
+
+_NAME_PATTERNS = [
+    re.compile(r"(?:我叫|我的名字叫|我的名字是|叫我)(?P<name>[\u4e00-\u9fffA-Za-z]{2,12})"),
+    re.compile(r"(?:可以叫我|大家都叫我)(?P<name>[\u4e00-\u9fffA-Za-z]{2,12})"),
+]
+
+_LOCATION_PATTERNS = [
+    re.compile(r"(?:来自|来自于|住在|生活在|出生在)(?P<location>[\u4e00-\u9fffA-Za-z]{2,15})"),
+    re.compile(r"在(?P<location>[\u4e00-\u9fffA-Za-z]{2,15})(?:工作|上学|读书|生活)"),
+]
+
+_AGE_PATTERN = re.compile(r"(?:我|今年|现在)(?:今年)?(?P<age>\d{1,2})岁")
+_BIRTHDAY_PATTERN = re.compile(r"(?:生日|生日至|生在)(?P<birthday>\d{1,2}月\d{1,2}日)")
+
+_INTEREST_KEYWORDS = {
+    "喜欢": "interest",
+    "热爱": "interest",
+    "爱好": "interest",
+    "痴迷": "interest",
+    "偏爱": "interest",
+    "最喜欢": "interest",
+    "爱吃": "like",
+    "爱喝": "like",
+    "爱看": "like",
+    "讨厌": "dislike",
+    "不喜欢": "dislike",
+}
+
+_PROFESSION_KEYWORDS = [
+    "老师", "会计", "财务", "学生", "社长", "部长", "经理", "顾问", "秘书", "设计师",
+    "工程师", "程序员", "医生", "护士", "律师", "作家", "研究员", "分析师", "队长", "指挥",
+]
+
+
+def _detect_profession(text: str) -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    for job in _PROFESSION_KEYWORDS:
+        phrase = f"我是{job}"
+        if phrase in text:
+            found.append(("profession", job))
+        phrase_alt = f"担任{job}"
+        if phrase_alt in text:
+            found.append(("profession", job))
+    return found
+
+
+def _extract_keyword_values(text: str) -> List[Tuple[str, str]]:
+    results: List[Tuple[str, str]] = []
+    for kw, key in _INTEREST_KEYWORDS.items():
+        start = 0
+        while True:
+            idx = text.find(kw, start)
+            if idx == -1:
+                break
+            frag = text[idx + len(kw): idx + len(kw) + 18]
+            value = re.split(r"[，。！？,.；;\s]", frag)[0]
+            value = _sanitize_fact_value(value)
+            if len(value) >= 2:
+                results.append((key, value))
+            start = idx + len(kw)
+    return results
+
+
+def detect_long_term_facts(user_text: str) -> List[Dict[str, Any]]:
+    text = (user_text or "").strip()
+    if not text:
+        return []
+
+    candidates: List[Tuple[str, str]] = []
+    for pat in _NAME_PATTERNS:
+        for match in pat.finditer(text):
+            value = _sanitize_fact_value(match.group("name"))
+            if len(value) >= 2:
+                candidates.append(("name", value))
+
+    for pat in _LOCATION_PATTERNS:
+        for match in pat.finditer(text):
+            value = _sanitize_fact_value(match.group("location"))
+            if len(value) >= 2:
+                candidates.append(("location", value))
+
+    for match in _AGE_PATTERN.finditer(text):
+        value = _sanitize_fact_value(match.group("age"))
+        if value:
+            candidates.append(("age", f"{value}岁"))
+
+    for match in _BIRTHDAY_PATTERN.finditer(text):
+        value = _sanitize_fact_value(match.group("birthday"))
+        if value:
+            candidates.append(("birthday", value))
+
+    candidates.extend(_extract_keyword_values(text))
+    candidates.extend(_detect_profession(text))
+
+    facts: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for key, value in candidates:
+        if not value:
+            continue
+        norm_key = key.lower().strip() or "fact"
+        norm_value = value.strip()
+        if not norm_value or (norm_key, norm_value) in seen:
+            continue
+        seen.add((norm_key, norm_value))
+        facts.append({
+            "type": "fact",
+            "key": norm_key,
+            "value": norm_value,
+            "source": "user",
+        })
+    return facts
+
+
+def append_long_term_memory(new_entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not new_entries:
+        return load_long_term_memory()
+    existing = load_long_term_memory()
+    seen = {(rec.get("key", ""), rec.get("value", "")) for rec in existing}
+    updated = list(existing)
+    for rec in new_entries:
+        key = _sanitize_fact_value(rec.get("key", "")) or "fact"
+        value = _sanitize_fact_value(rec.get("value", "") or rec.get("text", ""))
+        if not value or (key, value) in seen:
+            continue
+        entry = {
+            "type": rec.get("type", "fact"),
+            "key": key,
+            "value": value,
+            "source": rec.get("source", "user"),
+            "created_at": int(time.time()),
+        }
+        if rec.get("meta"):
+            entry["meta"] = rec["meta"]
+        updated.append(entry)
+        seen.add((key, value))
+    if len(updated) > 200:
+        updated = updated[-200:]
+    save_long_term_memory(updated)
+    return updated
+
+
+def build_long_term_memory_block(records: List[Dict[str, Any]], limit: int = 12) -> str:
+    if not records:
+        return ""
+    sorted_records = sorted(records, key=lambda r: int(r.get("created_at", 0)) or 0)
+    take = sorted_records[-limit:]
+    lines = []
+    for rec in take:
+        key = (rec.get("key") or "fact").lower()
+        value = _sanitize_fact_value(rec.get("value") or rec.get("text") or "")
+        if not value:
+            continue
+        label = _FACT_LABELS.get(key, key)
+        lines.append(f"- {label}：{value}")
+    return "\n".join(lines)
+
 
 def ensure_teacher_prefix(s: str) -> str:
     if s.startswith("[") and "]" in s.split(" ", 1)[0]:
@@ -833,24 +1058,27 @@ def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
     return filtered[0]
 
 # =============== 构造消息 ===============
-def format_system_prompt(persona_text: str, history_text: str, keyword_texts: List[str], user_input: str) -> str:
+def format_system_prompt(persona_text: str, history_text: str, long_term_text: str,
+                         keyword_texts: List[str], user_input: str) -> str:
     persona = persona_text.strip() if persona_text else "（未设置人物设定）"
     history = history_text.strip() if history_text else "（暂无历史记忆）"
+    long_term = long_term_text.strip() if long_term_text else "（暂无长期记忆）"
     keywords = "；".join(keyword_texts) if keyword_texts else "（暂无关键术语）"
     user = user_input.strip() if user_input else "（空输入）"
     return FRAME_PROMPT_TEMPLATE.format(
         persona=persona,
         history=history,
+        long_term=long_term,
         keywords=keywords,
         user_input=user,
     )
 
 
 def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
-                   persona_text: str, history_text: str,
+                   persona_text: str, history_text: str, long_term_text: str,
                    keyword_texts: List[str]) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = []
-    sys_content = format_system_prompt(persona_text, history_text, keyword_texts, user_text)
+    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, user_text)
     msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
         msgs.append(m)
@@ -860,7 +1088,7 @@ def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
 
 def build_messages_for_continue(history_msgs: List[Dict[str, str]],
                                 ui_hist: List[Tuple[str, str]],
-                                persona_text: str, history_text: str,
+                                persona_text: str, history_text: str, long_term_text: str,
                                 keyword_texts: List[str]) -> Tuple[List[Dict[str, str]], str]:
     """不把“继续”显示到UI；仅构造临时 msgs 以续写"""
     frag_pairs = ui_hist[-3:] if ui_hist else []
@@ -873,7 +1101,7 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     recent_frag = "\n".join(lines[-12:])
     hidden_user = "继续（不要重复开场白，直接承接你上一条的语气与内容展开；如需列点，从上次编号往下接）。\n【最近片段】\n" + recent_frag
 
-    sys_content = format_system_prompt(persona_text, history_text, keyword_texts, hidden_user)
+    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, hidden_user)
     msgs: List[Dict[str, str]] = []
     msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
@@ -916,6 +1144,8 @@ def _init_gradio_app():
             btn_repeat = gr.Button("重新说 ⟳", variant="secondary")
             clear = gr.Button("清空对话", variant="secondary")
 
+        mem_export = gr.File(label="长期记忆导出", interactive=False)
+
         state_msgs = gr.State([{"role":"system","content":"(hidden)"}])
         state_mem = gr.State(new_memory(DEFAULT_MEM_ID))
         state_dynamic = gr.State(new_dynamic_state())
@@ -931,16 +1161,21 @@ def _init_gradio_app():
         def do_save_mem(mem_obj, mem_id_text):
             mem_obj["id"] = mem_id_text or DEFAULT_MEM_ID
             save_memory(mem_obj)
-            gr.Info(f"已保存记忆：{mem_obj['id']}")
-            return None
-        btn_save_mem.click(do_save_mem, inputs=[state_mem, mem_id], outputs=[])
+            export_path = export_long_term_memory()
+            if export_path:
+                gr.Info(f"已保存记忆：{mem_obj['id']}；长期记忆可下载")
+            else:
+                gr.Info(f"已保存记忆：{mem_obj['id']}（暂无长期记忆）")
+            return export_path
+        btn_save_mem.click(do_save_mem, inputs=[state_mem, mem_id], outputs=[mem_export])
 
         def do_clear_mem(mem_id_text):
             m = new_memory(mem_id_text or DEFAULT_MEM_ID)
             save_memory(m)
-            gr.Info("记忆与对话已清空")
-            return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state()
-        btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic])
+            clear_long_term_memory()
+            gr.Info("记忆、长期记忆与对话已清空")
+            return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state(), None
+        btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic, mem_export])
 
         # === 发消息 ===
         def _send(user_input, ui_hist, msg_hist, mem_obj, dyn_state,
@@ -956,13 +1191,22 @@ def _init_gradio_app():
             persona_text = build_persona_block()
             history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
 
+            if mem_en_flag:
+                long_term_records = load_long_term_memory()
+                new_facts = detect_long_term_facts(user_input)
+                if new_facts:
+                    long_term_records = append_long_term_memory(new_facts)
+                long_term_text = build_long_term_memory_block(long_term_records)
+            else:
+                long_term_text = ""
+
             dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
             keywords_for_prompt = list(keyword_texts)
             if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
                 keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
 
             msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
-                                  user_input, persona_text, history_text, keywords_for_prompt)
+                                  user_input, persona_text, history_text, long_term_text, keywords_for_prompt)
             max_new = int(max_tokens)
             min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
             gen_kwargs = dict(
@@ -1012,6 +1256,7 @@ def _init_gradio_app():
                         temp_ui,
                         persona_text,
                         history_text,
+                        long_term_text,
                         keywords_for_prompt,
                     )
                     more = _sample_reply(msgs_continue, temp_ui)
@@ -1081,6 +1326,11 @@ def _init_gradio_app():
 
             persona_text = build_persona_block()
             history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
+            if mem_en_flag:
+                long_term_records = load_long_term_memory()
+                long_term_text = build_long_term_memory_block(long_term_records)
+            else:
+                long_term_text = ""
             keywords_for_prompt = collect_dynamic_keywords(dyn_state) if use_rag_flag else []
 
             last_user = ""
@@ -1096,6 +1346,7 @@ def _init_gradio_app():
                 ui_hist or [],
                 persona_text,
                 history_text,
+                long_term_text,
                 keywords_for_prompt,
             )
             max_new = int(max_tokens)
