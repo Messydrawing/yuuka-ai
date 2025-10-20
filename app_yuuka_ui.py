@@ -22,11 +22,35 @@ import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Optional
 
-import gradio as gr
+GRADIO_AVAILABLE = True
+try:
+    import gradio as gr
+except ModuleNotFoundError:
+    if os.environ.get("YUKA_REQUIRE_GRADIO") == "1":
+        raise
+    GRADIO_AVAILABLE = False
+    gr = None  # type: ignore
 
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from peft import PeftModel
+try:
+    import torch
+except ModuleNotFoundError:
+    if os.environ.get("YUKA_REQUIRE_TORCH") == "1":
+        raise
+    torch = None  # type: ignore
+
+try:
+    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+except ModuleNotFoundError:
+    if os.environ.get("YUKA_REQUIRE_TRANSFORMERS") == "1":
+        raise
+    AutoTokenizer = AutoModelForCausalLM = BitsAndBytesConfig = None  # type: ignore
+
+try:
+    from peft import PeftModel
+except ModuleNotFoundError:
+    if os.environ.get("YUKA_REQUIRE_PEFT") == "1":
+        raise
+    PeftModel = None  # type: ignore
 
 # ================== 路径/目录 ==================
 OFFLOAD_DIR = Path("offload")
@@ -381,6 +405,9 @@ def score_candidate(text: str, recent_ref: Optional[str] = None) -> float:
 
 # =============== 模型加载（Qwen2.5 推理路径） ===============
 def load_model():
+    if torch is None or AutoTokenizer is None or AutoModelForCausalLM is None or BitsAndBytesConfig is None or PeftModel is None:
+        raise RuntimeError("缺少模型依赖，无法加载模型。")
+
     tok = AutoTokenizer.from_pretrained(
         BASE_MODEL, trust_remote_code=True, local_files_only=True
     )
@@ -463,14 +490,21 @@ def load_model():
     return tok, mdl, eos_ids
 
 # ====== 初始化 ======
-tokenizer, model, EOS_IDS = load_model()
+tokenizer = None
+model = None
+EOS_IDS: List[int] = []
+
+if os.environ.get("YUKA_SKIP_MODEL_LOAD") == "1":
+    EOS_IDS = []
+else:
+    tokenizer, model, EOS_IDS = load_model()
 
 BAN_STRINGS = ["http", "https", "www.", "sourceMappingURL", "#", "Teacher", "teacher", "sensei"]
-BAD_WORDS_IDS = [ids for s in BAN_STRINGS if (ids := tokenizer.encode(s, add_special_tokens=False))]
+BAD_WORDS_IDS = [ids for s in BAN_STRINGS if tokenizer is not None and (ids := tokenizer.encode(s, add_special_tokens=False))]
 keyword_memory = KeywordMemory(KB_MEMORY_FILE)
 
 # =============== Chat 模板与编码（Qwen 官方方式） ===============
-def _apply_chat_template(msgs: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+def _apply_chat_template(msgs: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     使用 tokenizer.apply_chat_template 生成单条文本，再一次性分词为张量。
     """
@@ -485,12 +519,21 @@ def _apply_chat_template(msgs: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
 
 # =============== 记忆压缩（摘要亦走同一生成通道） ===============
 def summarize_turns(turns: List[Dict], max_tokens=160) -> str:
+    if tokenizer is None or model is None:
+        raise RuntimeError("模型尚未加载，无法生成摘要。")
+
     text_lines = []
     for t in turns:
         text_lines.append(f"[老师]{t['u']}")
         text_lines.append(f"[优香]{t['a']}")
     convo = "\n".join(text_lines[-60:])
-    sys = "你是总结助手。请把以下对话概括为2-4行要点，保留人名/事件/态度，不新增信息，简体中文。"
+    sys = (
+        "你是总结助手。请把以下对话整理为结构化摘要，使用简体中文并严格按以下顺序输出：\n"
+        "【对话概览】列出2-3个要点描述对话的主要事实或事件；\n"
+        "【当前优香对老师的态度/情绪】用一句话概括优香此刻对老师的态度与情绪；\n"
+        "【关系进展要点】列出1-2个要点说明关系上的变化、承诺或后续行动。\n"
+        "不要编造信息，保持简洁并保留关键名词。"
+    )
     msgs = [{"role": "system", "content": sys},
             {"role": "user", "content": convo}]
     inputs = _apply_chat_template(msgs)
@@ -507,6 +550,136 @@ def summarize_turns(turns: List[Dict], max_tokens=160) -> str:
     summary = tokenizer.decode(gen_ids, skip_special_tokens=True).strip()
     return summary
 
+
+def _compress_summary_if_needed(summary: str, max_chars: int = 360, depth: int = 0, max_depth: int = 2) -> str:
+    if not summary or len(summary) <= max_chars or depth >= max_depth:
+        return summary.strip()
+
+    pseudo_turns = [{"u": line.strip(), "a": ""} for line in summary.splitlines() if line.strip()]
+    if not pseudo_turns:
+        return summary[:max_chars]
+
+    try:
+        shorter = summarize_turns(pseudo_turns, max_tokens=120)
+    except RuntimeError:
+        return summary.strip()[:max_chars]
+
+    shorter = shorter.strip()
+    if not shorter or shorter == summary.strip():
+        return summary.strip()[:max_chars]
+
+    if len(shorter) >= len(summary):
+        return summary.strip()[:max_chars]
+
+    return _compress_summary_if_needed(shorter, max_chars=max_chars, depth=depth + 1, max_depth=max_depth)
+
+
+def _dedupe_preserve(items: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    result: List[str] = []
+    for item in items:
+        key = item.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def parse_structured_summary(summary: str) -> Dict[str, Any]:
+    sections: Dict[str, Any] = {
+        "overview": [],
+        "attitude": "",
+        "progress": [],
+    }
+    if not summary:
+        return sections
+
+    current: Optional[str] = None
+    for raw_line in summary.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if "对话" in line and ("概" in line or "要点" in line):
+            current = "overview"
+            value = ""
+            if "：" in line:
+                value = line.split("：", 1)[1].strip()
+            elif "】" in line:
+                value = line.split("】", 1)[1].strip()
+            if value:
+                sections["overview"].append(value)
+            continue
+        if "当前优香对老师的态度" in line or "态度/情绪" in line:
+            current = "attitude"
+            value = ""
+            if "：" in line:
+                value = line.split("：", 1)[1].strip()
+            elif "】" in line:
+                value = line.split("】", 1)[1].strip()
+            if value:
+                sections["attitude"] = value
+            continue
+        if "关系" in line and "进展" in line:
+            current = "progress"
+            value = ""
+            if "：" in line:
+                value = line.split("：", 1)[1].strip()
+            elif "】" in line:
+                value = line.split("】", 1)[1].strip()
+            if value:
+                sections["progress"].append(value)
+            continue
+
+        cleaned = line.lstrip("-·• ").strip()
+        if current == "overview":
+            sections["overview"].append(cleaned)
+        elif current == "progress":
+            sections["progress"].append(cleaned)
+        elif current == "attitude" and not sections["attitude"]:
+            sections["attitude"] = cleaned
+
+    sections["overview"] = _dedupe_preserve(sections["overview"])
+    sections["progress"] = _dedupe_preserve(sections["progress"])
+
+    if not sections["overview"] and summary.strip():
+        sections["overview"] = [summary.strip()]
+
+    if not sections["attitude"]:
+        sections["attitude"] = ""
+
+    return sections
+
+
+def _truncate(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def render_structured_summary(summary: str, line_limit: int = 200) -> List[str]:
+    sections = parse_structured_summary(summary)
+    lines: List[str] = []
+
+    if not sections["overview"] and not sections["attitude"] and not sections["progress"]:
+        if summary.strip():
+            lines.append(f"- {_truncate(summary.strip(), line_limit)}")
+        return lines
+
+    if sections["overview"]:
+        lines.append("- 对话概览：")
+        for item in sections["overview"][:3]:
+            lines.append(f"  · {_truncate(item, line_limit)}")
+
+    if sections["attitude"]:
+        lines.append(f"- 当前优香对老师的态度/情绪：{_truncate(sections['attitude'], line_limit)}")
+
+    if sections["progress"]:
+        lines.append("- 关系进展要点：")
+        for item in sections["progress"][:3]:
+            lines.append(f"  · {_truncate(item, line_limit)}")
+
+    return lines
+
 def refresh_memory_layers(mem: Dict):
     n = len(mem["turns"])
     if n <= RAW_KEEP_TURNS:
@@ -521,6 +694,7 @@ def refresh_memory_layers(mem: Dict):
         while i + BLOCK_SIZE <= end_block:
             block = mem["turns"][i:i+BLOCK_SIZE]
             summ = summarize_turns(block)
+            summ = _compress_summary_if_needed(summ)
             mem["block_summaries"].append({"start": i, "end": i+BLOCK_SIZE-1, "summary": summ})
             i += BLOCK_SIZE
 
@@ -537,7 +711,8 @@ def refresh_memory_layers(mem: Dict):
         early = mem["turns"][:max(0, n - RAW_KEEP_TURNS - BLOCK_RANGE_TURNS)]
         if early:
             sample = early[::SPARSE_STRIDE][:50]
-            mem["super_summary"] = summarize_turns(sample, max_tokens=120)
+            super_summ = summarize_turns(sample, max_tokens=120)
+            mem["super_summary"] = _compress_summary_if_needed(super_summ, max_chars=400)
 
 def build_memory_context(mem: Dict) -> str:
     lines = []
@@ -554,11 +729,11 @@ def build_memory_context(mem: Dict) -> str:
         lines.append("【较早摘要】")
         for b in mem["block_summaries"][-2:]:
             s = b["summary"].strip()
-            lines.append(f"- {s if len(s)<=200 else s[:200]+'…'}")
+            lines.extend(render_structured_summary(s, line_limit=200))
     if mem.get("super_summary"):
         lines.append("【更早的整体回顾】")
         ss = mem["super_summary"].strip()
-        lines.append(f"- {ss if len(ss)<=220 else ss[:220]+'…'}")
+        lines.extend(render_structured_summary(ss, line_limit=220))
     return "\n".join(lines)
 
 # =============== 生成 & 多样化 ===============
@@ -708,315 +883,324 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
 
 
 # =============== Gradio UI ===============
-with gr.Blocks(title="yuuka-ai") as demo:
-    gr.Markdown("### 优香（Qwen2.5 LoRA） · 会话记忆 + 关键术语提示\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说/重新说”。_")
+def _init_gradio_app():
+    with gr.Blocks(title="yuuka-ai") as demo:
+        gr.Markdown("### 优香（Qwen2.5 LoRA） · 会话记忆 + 关键术语提示\n_系统设定隐藏；支持加载/保存记忆、多样化输出与“继续说/重新说”。_")
 
-    with gr.Row():
-        use_rag = gr.Checkbox(label="启用关键术语提示", value=True)
-        mem_enabled = gr.Checkbox(label="启用会话记忆（持久化）", value=True)
-        mem_id = gr.Textbox(label="记忆ID（文件名）", value=DEFAULT_MEM_ID, scale=2)
-        btn_load_mem = gr.Button("加载记忆", variant="secondary")
-        btn_save_mem = gr.Button("保存记忆", variant="secondary")
-        btn_clear_mem = gr.Button("清空记忆", variant="stop")
+        with gr.Row():
+            use_rag = gr.Checkbox(label="启用关键术语提示", value=True)
+            mem_enabled = gr.Checkbox(label="启用会话记忆（持久化）", value=True)
+            mem_id = gr.Textbox(label="记忆ID（文件名）", value=DEFAULT_MEM_ID, scale=2)
+            btn_load_mem = gr.Button("加载记忆", variant="secondary")
+            btn_save_mem = gr.Button("保存记忆", variant="secondary")
+            btn_clear_mem = gr.Button("清空记忆", variant="stop")
 
-    with gr.Row():
-        temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
-        top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.01, label="Top-p")
-        typical_slider = gr.Slider(0.5, 1.0, value=1.0, step=0.01, label="typical_p（=1 关闭；与 Top-p 二选一）")
-        repetition_penalty = gr.Slider(1.0, 1.3, value=1.2, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
+        with gr.Row():
+            temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
+            top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.01, label="Top-p")
+            typical_slider = gr.Slider(0.5, 1.0, value=1.0, step=0.01, label="typical_p（=1 关闭；与 Top-p 二选一）")
+            repetition_penalty = gr.Slider(1.0, 1.3, value=1.2, step=0.01, label="重复惩罚")
+            no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
 
-    with gr.Row():
-        diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
-        k_candidates = gr.Slider(1, 3, value=2, step=1, label="候选数 k")
-        max_new = gr.Slider(64, 512, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
-        refine_enabled = gr.Checkbox(label="启用二阶段精修", value=False)
+        with gr.Row():
+            diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
+            k_candidates = gr.Slider(1, 3, value=2, step=1, label="候选数 k")
+            max_new = gr.Slider(64, 512, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
+            refine_enabled = gr.Checkbox(label="启用二阶段精修", value=False)
 
-    chat = gr.Chatbot(height=520, label="与优香对话", type="tuples")
-    txt = gr.Textbox(placeholder="和优香聊点什么吧…（直接输入即可）", show_label=False)
-    with gr.Row():
-        send = gr.Button("发送", variant="primary")
-        btn_continue = gr.Button("继续说 ▶", variant="secondary")
-        btn_repeat = gr.Button("重新说 ⟳", variant="secondary")
-        clear = gr.Button("清空对话", variant="secondary")
+        chat = gr.Chatbot(height=520, label="与优香对话", type="tuples")
+        txt = gr.Textbox(placeholder="和优香聊点什么吧…（直接输入即可）", show_label=False)
+        with gr.Row():
+            send = gr.Button("发送", variant="primary")
+            btn_continue = gr.Button("继续说 ▶", variant="secondary")
+            btn_repeat = gr.Button("重新说 ⟳", variant="secondary")
+            clear = gr.Button("清空对话", variant="secondary")
 
-    state_msgs = gr.State([{"role":"system","content":"(hidden)"}])
-    state_mem = gr.State(new_memory(DEFAULT_MEM_ID))
-    state_dynamic = gr.State(new_dynamic_state())
+        state_msgs = gr.State([{"role":"system","content":"(hidden)"}])
+        state_mem = gr.State(new_memory(DEFAULT_MEM_ID))
+        state_dynamic = gr.State(new_dynamic_state())
 
-    # === 记忆按钮 ===
-    def do_load_mem(mem_id_text):
-        mem = load_memory(mem_id_text or DEFAULT_MEM_ID)
-        ui = [[t["u"], t["a"]] for t in mem["turns"][-10:]]
-        gr.Info(f"已加载记忆：{mem_id_text or DEFAULT_MEM_ID}")
-        return mem, ui
-    btn_load_mem.click(do_load_mem, inputs=[mem_id], outputs=[state_mem, chat])
+        # === 记忆按钮 ===
+        def do_load_mem(mem_id_text):
+            mem = load_memory(mem_id_text or DEFAULT_MEM_ID)
+            ui = [[t["u"], t["a"]] for t in mem["turns"][-10:]]
+            gr.Info(f"已加载记忆：{mem_id_text or DEFAULT_MEM_ID}")
+            return mem, ui
+        btn_load_mem.click(do_load_mem, inputs=[mem_id], outputs=[state_mem, chat])
 
-    def do_save_mem(mem_obj, mem_id_text):
-        mem_obj["id"] = mem_id_text or DEFAULT_MEM_ID
-        save_memory(mem_obj)
-        gr.Info(f"已保存记忆：{mem_obj['id']}")
-        return None
-    btn_save_mem.click(do_save_mem, inputs=[state_mem, mem_id], outputs=[])
-
-    def do_clear_mem(mem_id_text):
-        m = new_memory(mem_id_text or DEFAULT_MEM_ID)
-        save_memory(m)
-        gr.Info("记忆与对话已清空")
-        return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state()
-    btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic])
-
-    # === 发消息 ===
-    def _send(user_input, ui_hist, msg_hist, mem_obj, dyn_state,
-              use_rag_flag, mem_en_flag,
-              temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
-
-        if not user_input.strip():
-            return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
-
-        mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
-        dyn_state = ensure_dynamic_state(dyn_state)
-
-        persona_text = build_persona_block()
-        history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
-
-        dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
-        keywords_for_prompt = list(keyword_texts)
-        if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
-            keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
-
-        msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
-                              user_input, persona_text, history_text, keywords_for_prompt)
-        max_new = int(max_tokens)
-        min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
-        gen_kwargs = dict(
-            max_new_tokens=max_new,
-            temperature=float(temp),
-            top_p=float(topp),
-            typical_p=float(typical_val),
-            repetition_penalty=float(rep_pen),
-            no_repeat_ngram_size=int(ngram),
-            length_penalty=DEFAULT_LENGTH_PENALTY,
-            min_new_tokens=min_new,
-        )
-
-        def _sample_reply(msgs_for_gen, history_for_score):
-            if diverse_flag and int(k_cand) > 1:
-                result = generate_diverse(msgs_for_gen, int(k_cand), history_for_score or [], **gen_kwargs)
-                if result:
-                    return result
-            return generate_one(msgs_for_gen, **gen_kwargs)
-
-        reply = _sample_reply(msgs, ui_hist or []) or ""
-        if refine_flag:
-            reply = refine_short(reply, tokenizer, model)
-
-        ui_hist_next = list(ui_hist or [])
-        ui_hist_next.append([user_input, reply])
-        msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
-        msg_hist_next.extend([
-            {"role": "user", "content": ensure_teacher_prefix(user_input)},
-            {"role": "assistant", "content": reply},
-        ])
-
-        temp_ui = []
-        for pair in ui_hist_next:
-            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                temp_ui.append([pair[0], pair[1]])
-            else:
-                temp_ui.append([pair, ""])
-        temp_msgs = list(msg_hist_next)
-        current_reply = reply
-        if not refine_flag:
-            for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
-                if not should_auto_continue(current_reply):
-                    break
-                msgs_continue, hidden_user = build_messages_for_continue(
-                    temp_msgs,
-                    temp_ui,
-                    persona_text,
-                    history_text,
-                    keywords_for_prompt,
-                )
-                more = _sample_reply(msgs_continue, temp_ui)
-                if not more or violates_rules(more) or not more.strip():
-                    break
-                if len(more.strip()) < 6 and len(current_reply.strip()) > MIN_REPLY_CHARS:
-                    break
-                if not current_reply.endswith("\n") and current_reply:
-                    current_reply = current_reply + "\n"
-                current_reply = current_reply + more
-                temp_ui[-1][1] = current_reply
-                temp_msgs.append({"role": "assistant", "content": more})
-
-        full_reply = temp_ui[-1][1]
-        reply = extract_first_sentence(full_reply)
-        temp_ui[-1][1] = reply
-
-        last_user_idx = None
-        for idx in range(len(temp_msgs) - 1, -1, -1):
-            if temp_msgs[idx].get("role") == "user":
-                last_user_idx = idx
-                break
-        if last_user_idx is not None and last_user_idx + 1 < len(temp_msgs):
-            temp_msgs = temp_msgs[:last_user_idx + 2]
-            temp_msgs[-1]["content"] = reply
-
-        ui_hist = temp_ui
-        msg_hist = temp_msgs
-        if len(msg_hist) > 13:
-            msg_hist = msg_hist[:1] + msg_hist[-12:]
-
-        if mem_en_flag:
-            mem_obj["turns"].append({"u": user_input, "a": reply})
-            refresh_memory_layers(mem_obj)
+        def do_save_mem(mem_obj, mem_id_text):
+            mem_obj["id"] = mem_id_text or DEFAULT_MEM_ID
             save_memory(mem_obj)
+            gr.Info(f"已保存记忆：{mem_obj['id']}")
+            return None
+        btn_save_mem.click(do_save_mem, inputs=[state_mem, mem_id], outputs=[])
 
-        return ui_hist, msg_hist, mem_obj, dyn_state
+        def do_clear_mem(mem_id_text):
+            m = new_memory(mem_id_text or DEFAULT_MEM_ID)
+            save_memory(m)
+            gr.Info("记忆与对话已清空")
+            return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state()
+        btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic])
 
-    send.click(
-        _send,
-        inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
-                use_rag, mem_enabled,
-                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem, state_dynamic]
-    ).then(lambda: "", None, txt)
-
-    txt.submit(
-        _send,
-        inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
-                use_rag, mem_enabled,
-                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem, state_dynamic]
-    ).then(lambda: "", None, txt)
-
-    # === 继续说（智能续写；不显示“继续”的用户消息；直接拼到上一条助手回复） ===
-    def _continue(ui_hist, msg_hist, mem_obj, dyn_state,
+        # === 发消息 ===
+        def _send(user_input, ui_hist, msg_hist, mem_obj, dyn_state,
                   use_rag_flag, mem_en_flag,
                   temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
 
-        if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
-            return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+            if not user_input.strip():
+                return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
 
-        mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
-        dyn_state = ensure_dynamic_state(dyn_state)
-
-        persona_text = build_persona_block()
-        history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
-        keywords_for_prompt = collect_dynamic_keywords(dyn_state) if use_rag_flag else []
-
-        last_user = ""
-        for m in reversed(msg_hist or []):
-            if m.get("role") == "user":
-                last_user = m.get("content", "")
-                break
-        if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
-            keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
-
-        msgs, hidden_user = build_messages_for_continue(
-            msg_hist or [{"role": "system", "content": "(hidden)"}],
-            ui_hist or [],
-            persona_text,
-            history_text,
-            keywords_for_prompt,
-        )
-        max_new = int(max_tokens)
-        min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
-        gen_kwargs = dict(
-            max_new_tokens=max_new,
-            temperature=float(temp),
-            top_p=float(topp),
-            typical_p=float(typical_val),
-            repetition_penalty=float(rep_pen),
-            no_repeat_ngram_size=int(ngram),
-            length_penalty=DEFAULT_LENGTH_PENALTY,
-            min_new_tokens=min_new,
-        )
-        if diverse_flag and int(k_cand) > 1:
-            more = generate_diverse(msgs, int(k_cand), ui_hist or [], **gen_kwargs)
-            if not more:
-                more = generate_one(msgs, **gen_kwargs)
-        else:
-            more = generate_one(msgs, **gen_kwargs)
-
-        if refine_flag:
-            more = refine_short(more, tokenizer, model)
-
-        # 1) UI：把新内容接到上一条助手消息上
-        prev_u, prev_a = ui_hist[-1]
-        combined = prev_a + ("\n" if prev_a and not prev_a.endswith("\n") else "") + more
-        truncated = extract_first_sentence(combined)
-        ui_hist[-1] = [prev_u, truncated]
-
-        # 2) 历史消息：仅保留截断后的助手消息
-        msg_hist = msg_hist or [{"role": "system", "content": "(hidden)"}]
-        if msg_hist and msg_hist[-1].get("role") == "assistant":
-            msg_hist[-1]["content"] = truncated
-        if len(msg_hist) > 13:
-            msg_hist = msg_hist[:1] + msg_hist[-12:]
-
-        # 3) 会话记忆：保持仅存第一句
-        if mem_en_flag:
             mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
-            if mem_obj.get("turns"):
-                existing = mem_obj["turns"][-1]["a"] or ""
-                combined_mem = existing + ("\n" if existing else "") + more
-                mem_obj["turns"][-1]["a"] = extract_first_sentence(combined_mem)
+            dyn_state = ensure_dynamic_state(dyn_state)
+
+            persona_text = build_persona_block()
+            history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
+
+            dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
+            keywords_for_prompt = list(keyword_texts)
+            if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
+                keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
+
+            msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
+                                  user_input, persona_text, history_text, keywords_for_prompt)
+            max_new = int(max_tokens)
+            min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
+            gen_kwargs = dict(
+                max_new_tokens=max_new,
+                temperature=float(temp),
+                top_p=float(topp),
+                typical_p=float(typical_val),
+                repetition_penalty=float(rep_pen),
+                no_repeat_ngram_size=int(ngram),
+                length_penalty=DEFAULT_LENGTH_PENALTY,
+                min_new_tokens=min_new,
+            )
+
+            def _sample_reply(msgs_for_gen, history_for_score):
+                if diverse_flag and int(k_cand) > 1:
+                    result = generate_diverse(msgs_for_gen, int(k_cand), history_for_score or [], **gen_kwargs)
+                    if result:
+                        return result
+                return generate_one(msgs_for_gen, **gen_kwargs)
+
+            reply = _sample_reply(msgs, ui_hist or []) or ""
+            if refine_flag:
+                reply = refine_short(reply, tokenizer, model)
+
+            ui_hist_next = list(ui_hist or [])
+            ui_hist_next.append([user_input, reply])
+            msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
+            msg_hist_next.extend([
+                {"role": "user", "content": ensure_teacher_prefix(user_input)},
+                {"role": "assistant", "content": reply},
+            ])
+
+            temp_ui = []
+            for pair in ui_hist_next:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    temp_ui.append([pair[0], pair[1]])
+                else:
+                    temp_ui.append([pair, ""])
+            temp_msgs = list(msg_hist_next)
+            current_reply = reply
+            if not refine_flag:
+                for _ in range(AUTO_CONTINUE_MAX_ROUNDS):
+                    if not should_auto_continue(current_reply):
+                        break
+                    msgs_continue, hidden_user = build_messages_for_continue(
+                        temp_msgs,
+                        temp_ui,
+                        persona_text,
+                        history_text,
+                        keywords_for_prompt,
+                    )
+                    more = _sample_reply(msgs_continue, temp_ui)
+                    if not more or violates_rules(more) or not more.strip():
+                        break
+                    if len(more.strip()) < 6 and len(current_reply.strip()) > MIN_REPLY_CHARS:
+                        break
+                    if not current_reply.endswith("\n") and current_reply:
+                        current_reply = current_reply + "\n"
+                    current_reply = current_reply + more
+                    temp_ui[-1][1] = current_reply
+                    temp_msgs.append({"role": "assistant", "content": more})
+
+            full_reply = temp_ui[-1][1]
+            reply = extract_first_sentence(full_reply)
+            temp_ui[-1][1] = reply
+
+            last_user_idx = None
+            for idx in range(len(temp_msgs) - 1, -1, -1):
+                if temp_msgs[idx].get("role") == "user":
+                    last_user_idx = idx
+                    break
+            if last_user_idx is not None and last_user_idx + 1 < len(temp_msgs):
+                temp_msgs = temp_msgs[:last_user_idx + 2]
+                temp_msgs[-1]["content"] = reply
+
+            ui_hist = temp_ui
+            msg_hist = temp_msgs
+            if len(msg_hist) > 13:
+                msg_hist = msg_hist[:1] + msg_hist[-12:]
+
+            if mem_en_flag:
+                mem_obj["turns"].append({"u": user_input, "a": reply})
+                refresh_memory_layers(mem_obj)
+                save_memory(mem_obj)
+
+            return ui_hist, msg_hist, mem_obj, dyn_state
+
+        send.click(
+            _send,
+            inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
+                    use_rag, mem_enabled,
+                    temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                    diverse, k_candidates, max_new, refine_enabled],
+            outputs=[chat, state_msgs, state_mem, state_dynamic]
+        ).then(lambda: "", None, txt)
+
+        txt.submit(
+            _send,
+            inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
+                    use_rag, mem_enabled,
+                    temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                    diverse, k_candidates, max_new, refine_enabled],
+            outputs=[chat, state_msgs, state_mem, state_dynamic]
+        ).then(lambda: "", None, txt)
+
+        # === 继续说（智能续写；不显示“继续”的用户消息；直接拼到上一条助手回复） ===
+        def _continue(ui_hist, msg_hist, mem_obj, dyn_state,
+                      use_rag_flag, mem_en_flag,
+                      temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
+
+            if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
+                return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+
+            mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
+            dyn_state = ensure_dynamic_state(dyn_state)
+
+            persona_text = build_persona_block()
+            history_text = build_memory_context(mem_obj) if mem_obj.get("turns") else ""
+            keywords_for_prompt = collect_dynamic_keywords(dyn_state) if use_rag_flag else []
+
+            last_user = ""
+            for m in reversed(msg_hist or []):
+                if m.get("role") == "user":
+                    last_user = m.get("content", "")
+                    break
+            if any(kw in (last_user or "") for kw in ACCOUNTING_KEYWORDS):
+                keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
+
+            msgs, hidden_user = build_messages_for_continue(
+                msg_hist or [{"role": "system", "content": "(hidden)"}],
+                ui_hist or [],
+                persona_text,
+                history_text,
+                keywords_for_prompt,
+            )
+            max_new = int(max_tokens)
+            min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
+            gen_kwargs = dict(
+                max_new_tokens=max_new,
+                temperature=float(temp),
+                top_p=float(topp),
+                typical_p=float(typical_val),
+                repetition_penalty=float(rep_pen),
+                no_repeat_ngram_size=int(ngram),
+                length_penalty=float(DEFAULT_LENGTH_PENALTY),
+                min_new_tokens=min_new,
+            )
+            if diverse_flag and int(k_cand) > 1:
+                more = generate_diverse(msgs, int(k_cand), ui_hist or [], **gen_kwargs)
+                if not more:
+                    more = generate_one(msgs, **gen_kwargs)
             else:
-                mem_obj["turns"].append({"u": "", "a": extract_first_sentence(more)})
-            refresh_memory_layers(mem_obj)
-            save_memory(mem_obj)
+                more = generate_one(msgs, **gen_kwargs)
 
-        return ui_hist, msg_hist, mem_obj, dyn_state
+            if refine_flag:
+                more = refine_short(more, tokenizer, model)
 
-    btn_continue.click(
-        _continue,
-        inputs=[chat, state_msgs, state_mem, state_dynamic,
-                use_rag, mem_enabled,
-                temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                diverse, k_candidates, max_new, refine_enabled],
-        outputs=[chat, state_msgs, state_mem, state_dynamic]
-    )
+            # 1) UI：把新内容接到上一条助手消息上
+            prev_u, prev_a = ui_hist[-1]
+            combined = prev_a + ("\n" if prev_a and not prev_a.endswith("\n") else "") + more
+            truncated = extract_first_sentence(combined)
+            ui_hist[-1] = [prev_u, truncated]
 
-    def _repeat(ui_hist, msg_hist, mem_obj, dyn_state):
-        dyn_state = ensure_dynamic_state(dyn_state)
-        if not msg_hist:
+            # 2) 历史消息：仅保留截断后的助手消息
+            msg_hist = msg_hist or [{"role": "system", "content": "(hidden)"}]
+            if msg_hist and msg_hist[-1].get("role") == "assistant":
+                msg_hist[-1]["content"] = truncated
+            if len(msg_hist) > 13:
+                msg_hist = msg_hist[:1] + msg_hist[-12:]
+
+            # 3) 会话记忆：保持仅存第一句
+            if mem_en_flag:
+                mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
+                if mem_obj.get("turns"):
+                    existing = mem_obj["turns"][-1]["a"] or ""
+                    combined_mem = existing + ("\n" if existing else "") + more
+                    mem_obj["turns"][-1]["a"] = extract_first_sentence(combined_mem)
+                else:
+                    mem_obj["turns"].append({"u": "", "a": extract_first_sentence(more)})
+                refresh_memory_layers(mem_obj)
+                save_memory(mem_obj)
+
             return ui_hist, msg_hist, mem_obj, dyn_state
-        last_assistant = None
-        for m in reversed(msg_hist):
-            if m.get("role") == "assistant":
-                last_assistant = m.get("content", "")
-                break
-        if not last_assistant:
-            return ui_hist, msg_hist, mem_obj, dyn_state
 
-        ui_hist_next = list(ui_hist or [])
-        ui_hist_next.append(["（重新说）", last_assistant])
+        btn_continue.click(
+            _continue,
+            inputs=[chat, state_msgs, state_mem, state_dynamic,
+                    use_rag, mem_enabled,
+                    temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                    diverse, k_candidates, max_new, refine_enabled],
+            outputs=[chat, state_msgs, state_mem, state_dynamic]
+        )
 
-        msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
-        msg_hist_next.append({"role": "assistant", "content": last_assistant})
-        if len(msg_hist_next) > 13:
-            msg_hist_next = msg_hist_next[:1] + msg_hist_next[-12:]
+        def _repeat(ui_hist, msg_hist, mem_obj, dyn_state):
+            dyn_state = ensure_dynamic_state(dyn_state)
+            if not msg_hist:
+                return ui_hist, msg_hist, mem_obj, dyn_state
+            last_assistant = None
+            for m in reversed(msg_hist):
+                if m.get("role") == "assistant":
+                    last_assistant = m.get("content", "")
+                    break
+            if not last_assistant:
+                return ui_hist, msg_hist, mem_obj, dyn_state
 
-        return ui_hist_next, msg_hist_next, mem_obj, dyn_state
+            ui_hist_next = list(ui_hist or [])
+            ui_hist_next.append(["（重新说）", last_assistant])
 
-    btn_repeat.click(
-        _repeat,
-        inputs=[chat, state_msgs, state_mem, state_dynamic],
-        outputs=[chat, state_msgs, state_mem, state_dynamic]
-    )
+            msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
+            msg_hist_next.append({"role": "assistant", "content": last_assistant})
+            if len(msg_hist_next) > 13:
+                msg_hist_next = msg_hist_next[:1] + msg_hist_next[-12:]
 
-    # === 重载关键术语记忆 ===
-    def reload_hard():
-        keyword_memory.load()
-        gr.Info("关键术语记忆已重载")
-        return None
-    gr.Button("重载关键术语", variant="secondary").click(reload_hard, outputs=[])
+            return ui_hist_next, msg_hist_next, mem_obj, dyn_state
 
-if __name__ == "__main__":
-    demo.queue().launch(
+        btn_repeat.click(
+            _repeat,
+            inputs=[chat, state_msgs, state_mem, state_dynamic],
+            outputs=[chat, state_msgs, state_mem, state_dynamic]
+        )
+
+        # === 重载关键术语记忆 ===
+        def reload_hard():
+            keyword_memory.load()
+            gr.Info("关键术语记忆已重载")
+            return None
+        gr.Button("重载关键术语", variant="secondary").click(reload_hard, outputs=[])
+
+    return demo
+
+
+if GRADIO_AVAILABLE:
+    demo = _init_gradio_app()
+else:
+    demo = None
+
+if __name__ == "__main__" and GRADIO_AVAILABLE:
+    (demo or _init_gradio_app()).queue().launch(
         server_name="127.0.0.1",
         server_port=7861,
         inbrowser=False,
