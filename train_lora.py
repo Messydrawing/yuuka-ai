@@ -365,28 +365,41 @@ def main():
     if args.persona_prefix:
         persona_text = f"{args.persona_prefix.strip()} {persona_text}".strip()
 
-    def _build_messages(ex: Dict[str, Any]) -> Dict[str, Any]:
-        context = str(ex.get("prompt", "")).strip()
-        completion = str(ex.get("completion", "")).strip()
-        if not context or not completion:
-            raise ValueError("每条样本必须包含 prompt 与 completion 字段")
-
-        prompt_text = (
-            "你是早濑优香，你的基础人设是（"
+    persona_message = {
+        "role": "system",
+        "content": (
+            "你是早濑优香。以下是你的人设："
             f"{persona_text}"
-            "），先前的对话内容为“"
-            f"{context}"
-            "”，请你继续对话："
-        )
+        ),
+    }
+
+    def _normalize_messages(ex: Dict[str, Any]) -> Dict[str, Any]:
+        raw_messages = ex.get("messages")
+        if not isinstance(raw_messages, list) or len(raw_messages) < 2:
+            raise ValueError("每条样本的 messages 字段必须为列表且至少包含两条消息。")
+
+        normalized: List[Dict[str, str]] = []
+        for msg in raw_messages:
+            role = str(msg.get("role") or "").strip()
+            content = str(msg.get("content") or "").strip()
+            if not role or not content:
+                raise ValueError("messages 中的每条消息必须包含非空的 role 与 content。")
+            normalized.append({"role": role, "content": content})
+
+        if normalized[-1]["role"] != "assistant":
+            raise ValueError("messages 的最后一条消息必须是 assistant 的回复。")
+
+        context_messages = normalized[:-1]
+        if not context_messages:
+            raise ValueError("messages 至少需要包含一条上下文消息供模型生成回复。")
+
+        new_messages = [persona_message.copy()] + context_messages + [normalized[-1]]
 
         new_ex = dict(ex)
-        new_ex["messages"] = [
-            {"role": "user", "content": prompt_text},
-            {"role": "assistant", "content": completion},
-        ]
+        new_ex["messages"] = new_messages
         return new_ex
 
-    dataset = dataset.map(_build_messages)
+    dataset = dataset.map(_normalize_messages)
 
     # 解析关键词权重
     token_weights_map: Dict[str, float] = {}
