@@ -21,6 +21,8 @@ import random
 import re
 import hashlib
 import importlib
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Optional, TYPE_CHECKING
 
@@ -112,6 +114,27 @@ SMALL_TALK_KEYWORDS = {
     "干嘛呢", "聊聊", "聊聊天", "待会见", "回来了", "拜拜", "再见", "辛苦了", "辛苦啦",
 }
 
+# =============== 主动问候（空闲触发）配置 ===============
+IDLE_MARKER_PREFIX = "\u200b:codex-terminal-citation[codex-terminal-citation]{"
+IDLE_MARKER_SUFFIX = "】"
+IDLE_MARKER_PATTERN = re.compile(r"^\u200b:codex-terminal-citation\\[codex-terminal-citation\\]\{(?P<meta>.+)】$")
+IDLE_TRIGGER_CHECK_INTERVAL = 5.0
+IDLE_TRIGGER_MIN_INTERVAL = 120.0
+IDLE_TRIGGER_MAX_INTERVAL = 420.0
+IDLE_TRIGGER_MAX_PER_DAY = 3
+
+
+def _format_idle_duration(seconds: int) -> str:
+    if seconds <= 0:
+        return "片刻"
+    if seconds < 60:
+        return f"约 {seconds} 秒"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"约 {minutes} 分钟"
+    hours = minutes // 60
+    return f"约 {hours} 小时"
+
 # =============== 分词 / 匹配辅助 ===============
 def _normalize_for_small_talk(text: str) -> str:
     t = text.lower()
@@ -140,6 +163,187 @@ def build_persona_block() -> str:
         text = PERSONA_FILE.read_text(encoding="utf-8").strip()
         return text or "（未设置人物设定）"
     return "（未设置人物设定）"
+
+
+def parse_idle_marker(text: str) -> Optional[Dict[str, str]]:
+    if not text:
+        return None
+    match = IDLE_MARKER_PATTERN.match(text.strip())
+    if not match:
+        return None
+    meta_str = match.group("meta")
+    parts = [seg for seg in meta_str.split() if seg.strip()]
+    result: Dict[str, str] = {}
+    for seg in parts:
+        if "=" not in seg:
+            continue
+        key, value = seg.split("=", 1)
+        result[key.strip()] = value.strip()
+    return result
+
+
+def build_idle_prompt(meta: Dict[str, str]) -> str:
+    seconds_raw = meta.get("idle_seconds") if meta else None
+    try:
+        seconds_val = int(float(seconds_raw)) if seconds_raw is not None else None
+    except (TypeError, ValueError):
+        seconds_val = None
+    duration_text = _format_idle_duration(seconds_val or 0)
+    return (
+        f"（系统主动问候）老师已经{duration_text}没有发言。"
+        "请你主动、轻松地问候老师，询问是否需要帮助或分享一些轻松话题，但要保持简洁。"
+    )
+
+
+def prepare_user_event(user_text: str) -> Dict[str, Any]:
+    idle_meta = parse_idle_marker(user_text)
+    if idle_meta:
+        prompt_text = build_idle_prompt(idle_meta)
+        return {
+            "prompt_text": prompt_text,
+            "conversation_user_text": prompt_text,
+            "ui_user_text": "（系统主动问候）",
+            "memory_user_text": "",
+            "is_idle": True,
+            "idle_meta": idle_meta,
+        }
+    stripped = (user_text or "").strip()
+    prefixed = ensure_teacher_prefix(stripped)
+    return {
+        "prompt_text": stripped,
+        "conversation_user_text": prefixed,
+        "ui_user_text": stripped,
+        "memory_user_text": stripped,
+        "is_idle": False,
+        "idle_meta": None,
+    }
+
+
+def _idle_trigger(session_id: str, idle_seconds: float) -> Dict[str, Any]:
+    seconds = int(max(0.0, float(idle_seconds)))
+    meta = {
+        "line_range_start": "770",
+        "line_range_end": "820",
+        "terminal_chunk_id": "IdleChat",
+        "idle_seconds": str(seconds),
+        "session": session_id,
+    }
+    marker = IDLE_MARKER_PREFIX + " ".join(f"{k}={v}" for k, v in meta.items()) + IDLE_MARKER_SUFFIX
+    return {"marker": marker, "meta": meta, "is_idle": True}
+
+
+class IdleManager:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._pending: Dict[str, List[Dict[str, Any]]] = {}
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _random_interval(self) -> float:
+        return random.uniform(IDLE_TRIGGER_MIN_INTERVAL, IDLE_TRIGGER_MAX_INTERVAL)
+
+    def _current_day(self):
+        return datetime.now(timezone.utc).date()
+
+    def _ensure_state(self, session_id: str) -> Dict[str, Any]:
+        today = self._current_day()
+        state = self._sessions.get(session_id)
+        if not state:
+            state = {
+                "enabled": False,
+                "last_input": time.time(),
+                "next_deadline": None,
+                "trigger_count": 0,
+                "day": today,
+            }
+            self._sessions[session_id] = state
+        elif state.get("day") != today:
+            state["day"] = today
+            state["trigger_count"] = 0
+        return state
+
+    def enable(self, session_id: str) -> None:
+        with self._lock:
+            state = self._ensure_state(session_id)
+            state["enabled"] = True
+            if state.get("next_deadline") is None:
+                state["next_deadline"] = time.time() + self._random_interval()
+
+    def disable(self, session_id: str) -> None:
+        with self._lock:
+            state = self._ensure_state(session_id)
+            state["enabled"] = False
+            state["next_deadline"] = None
+            self._pending.pop(session_id, None)
+
+    def mark_activity(self, session_id: str) -> None:
+        with self._lock:
+            state = self._ensure_state(session_id)
+            state["last_input"] = time.time()
+            if state.get("enabled"):
+                state["next_deadline"] = state["last_input"] + self._random_interval()
+                self._pending.pop(session_id, None)
+
+    def pop_event(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            queue = self._pending.get(session_id) or []
+            if not queue:
+                return None
+            event = queue.pop(0)
+            if not queue:
+                self._pending.pop(session_id, None)
+            return event
+
+    def _loop(self) -> None:
+        while True:
+            time.sleep(IDLE_TRIGGER_CHECK_INTERVAL)
+            now = time.time()
+            sessions: List[Tuple[str, Dict[str, Any]]] = []
+            with self._lock:
+                for sid, state in self._sessions.items():
+                    sessions.append((sid, dict(state)))
+            for session_id, state in sessions:
+                if not state.get("enabled"):
+                    continue
+                if state.get("next_deadline") is None:
+                    continue
+                if self._pending.get(session_id):
+                    continue
+                if state.get("trigger_count", 0) >= IDLE_TRIGGER_MAX_PER_DAY:
+                    continue
+                if now < float(state.get("next_deadline") or 0):
+                    continue
+                last_input = float(state.get("last_input") or now)
+                idle_seconds = max(0.0, now - last_input)
+                with self._lock:
+                    live_state = self._ensure_state(session_id)
+                    if not live_state.get("enabled"):
+                        continue
+                    if live_state.get("trigger_count", 0) >= IDLE_TRIGGER_MAX_PER_DAY:
+                        continue
+                    if live_state.get("next_deadline") and now < float(live_state["next_deadline"]):
+                        continue
+                    event = _idle_trigger(session_id, idle_seconds)
+                    self._pending.setdefault(session_id, []).append(event)
+                    live_state["trigger_count"] = live_state.get("trigger_count", 0) + 1
+                    live_state["last_input"] = now
+                    live_state["next_deadline"] = now + self._random_interval()
+
+
+idle_manager = IdleManager()
+
+
+def _get_session_id(request: Optional["gr.Request"]) -> str:
+    if request is None:
+        return "default"
+    session_hash = getattr(request, "session_hash", None)
+    if session_hash:
+        return str(session_hash)
+    client_id = getattr(request, "client", None)
+    if client_id:
+        return str(client_id)
+    return "default"
 
 # =============== 系统提示模板与关键术语记忆 ===============
 FRAME_PROMPT_TEMPLATE = (
@@ -1763,11 +1967,19 @@ def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
                    persona_text: str, history_text: str, long_term_text: str,
                    keyword_texts: List[str], dynamic_state: Dict[str, Any]) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = []
-    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, dynamic_state, user_text)
+    event_info = prepare_user_event(user_text)
+    sys_content = format_system_prompt(
+        persona_text,
+        history_text,
+        long_term_text,
+        keyword_texts,
+        dynamic_state,
+        event_info["prompt_text"],
+    )
     msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
         msgs.append(m)
-    msgs.append({"role": "user", "content": ensure_teacher_prefix(user_text)})
+    msgs.append({"role": "user", "content": event_info["conversation_user_text"]})
     return msgs
 
 
@@ -1820,6 +2032,7 @@ def _init_gradio_app():
             k_candidates = gr.Slider(1, 3, value=2, step=1, label="候选数 k")
             max_new = gr.Slider(64, 512, value=MAX_NEW_TOKENS, step=16, label="最大生成长度")
             refine_enabled = gr.Checkbox(label="启用二阶段精修", value=False)
+            idle_chat_enabled = gr.Checkbox(label="启用主动问候", value=False)
 
         chat = gr.Chatbot(height=520, label="与优香对话", type="tuples")
         txt = gr.Textbox(placeholder="和优香聊点什么吧…（直接输入即可）", show_label=False)
@@ -1875,10 +2088,21 @@ def _init_gradio_app():
         # === 发消息 ===
         def _send(user_input, ui_hist, msg_hist, mem_obj, dyn_state,
                   use_rag_flag, mem_en_flag,
-                  temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
+                  temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag,
+                  idle_enabled_flag, request: "gr.Request", event_context=None):
 
-            if not user_input.strip():
+            session_id = _get_session_id(request)
+            if idle_enabled_flag:
+                idle_manager.enable(session_id)
+            else:
+                idle_manager.disable(session_id)
+
+            normalized = prepare_user_event(user_input)
+            if not normalized["is_idle"] and not normalized["prompt_text"]:
                 return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+
+            if not normalized["is_idle"]:
+                idle_manager.mark_activity(session_id)
 
             mem_obj = mem_obj or new_memory(DEFAULT_MEM_ID)
             dyn_state = ensure_dynamic_state(dyn_state)
@@ -1888,19 +2112,30 @@ def _init_gradio_app():
 
             if mem_en_flag:
                 long_term_records = load_long_term_memory()
-                new_facts = detect_long_term_facts(user_input)
-                if new_facts:
-                    long_term_records = append_long_term_memory(new_facts)
+                if not normalized["is_idle"]:
+                    new_facts = detect_long_term_facts(normalized["prompt_text"])
+                    if new_facts:
+                        long_term_records = append_long_term_memory(new_facts)
                 long_term_text = build_long_term_memory_block(long_term_records)
             else:
                 long_term_text = ""
 
-            dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
-            keywords_for_prompt = list(keyword_texts)
+            if normalized["is_idle"]:
+                keywords_for_prompt = collect_dynamic_keywords(dyn_state) if use_rag_flag else []
+            else:
+                dyn_state, keyword_texts = advance_dynamic_state(
+                    dyn_state,
+                    normalized["prompt_text"],
+                    keyword_memory,
+                    bool(use_rag_flag),
+                )
+                keywords_for_prompt = list(keyword_texts)
+
             vector_snippets: List[str] = []
-            if bool(use_rag_flag) and hasattr(keyword_memory, "search_similar_fragments"):
+            search_basis = normalized["prompt_text"]
+            if not normalized["is_idle"] and bool(use_rag_flag) and hasattr(keyword_memory, "search_similar_fragments"):
                 try:
-                    hits = keyword_memory.search_similar_fragments(user_input, top_k=3)
+                    hits = keyword_memory.search_similar_fragments(search_basis, top_k=3)
                 except Exception:
                     hits = []
                 for hit in hits:
@@ -1912,11 +2147,18 @@ def _init_gradio_app():
                         vector_snippets.append(snippet)
             if vector_snippets:
                 keywords_for_prompt.extend(vector_snippets)
-            if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
+            if not normalized["is_idle"] and any(kw in (normalized["prompt_text"] or "") for kw in ACCOUNTING_KEYWORDS):
                 keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
 
-            msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
-                                  user_input, persona_text, history_text, long_term_text, keywords_for_prompt, dyn_state)
+            msgs = build_messages(
+                msg_hist or [{"role": "system", "content": "(hidden)"}],
+                user_input,
+                persona_text,
+                history_text,
+                long_term_text,
+                keywords_for_prompt,
+                dyn_state,
+            )
             max_new = int(max_tokens)
             min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
             gen_kwargs = dict(
@@ -1942,10 +2184,10 @@ def _init_gradio_app():
                 reply = refine_short(reply, tokenizer, model)
 
             ui_hist_next = list(ui_hist or [])
-            ui_hist_next.append([user_input, reply])
+            ui_hist_next.append([normalized["ui_user_text"], reply])
             msg_hist_next = list(msg_hist or [{"role": "system", "content": "(hidden)"}])
             msg_hist_next.extend([
-                {"role": "user", "content": ensure_teacher_prefix(user_input)},
+                {"role": "user", "content": normalized["conversation_user_text"]},
                 {"role": "assistant", "content": reply},
             ])
 
@@ -2003,7 +2245,7 @@ def _init_gradio_app():
             mem_obj["dynamic_state"] = dyn_state
 
             if mem_en_flag:
-                mem_obj["turns"].append({"u": user_input, "a": reply})
+                mem_obj["turns"].append({"u": normalized["memory_user_text"], "a": reply})
                 refresh_memory_layers(mem_obj)
                 try:
                     keyword_memory.queue_memory_fragments(mem_obj)
@@ -2024,7 +2266,8 @@ def _init_gradio_app():
             inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
                     use_rag, mem_enabled,
                     temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                    diverse, k_candidates, max_new, refine_enabled],
+                    diverse, k_candidates, max_new, refine_enabled,
+                    idle_chat_enabled],
             outputs=[chat, state_msgs, state_mem, state_dynamic]
         ).then(lambda: "", None, txt)
 
@@ -2033,14 +2276,23 @@ def _init_gradio_app():
             inputs=[txt, chat, state_msgs, state_mem, state_dynamic,
                     use_rag, mem_enabled,
                     temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                    diverse, k_candidates, max_new, refine_enabled],
+                    diverse, k_candidates, max_new, refine_enabled,
+                    idle_chat_enabled],
             outputs=[chat, state_msgs, state_mem, state_dynamic]
         ).then(lambda: "", None, txt)
 
         # === 继续说（智能续写；不显示“继续”的用户消息；直接拼到上一条助手回复） ===
         def _continue(ui_hist, msg_hist, mem_obj, dyn_state,
                       use_rag_flag, mem_en_flag,
-                      temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag):
+                      temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag,
+                      idle_enabled_flag, request: "gr.Request"):
+
+            session_id = _get_session_id(request)
+            if idle_enabled_flag:
+                idle_manager.enable(session_id)
+                idle_manager.mark_activity(session_id)
+            else:
+                idle_manager.disable(session_id)
 
             if not ui_hist or not isinstance(ui_hist[-1], (list, tuple)) or not ui_hist[-1][1]:
                 return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
@@ -2133,11 +2385,18 @@ def _init_gradio_app():
             inputs=[chat, state_msgs, state_mem, state_dynamic,
                     use_rag, mem_enabled,
                     temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
-                    diverse, k_candidates, max_new, refine_enabled],
+                    diverse, k_candidates, max_new, refine_enabled,
+                    idle_chat_enabled],
             outputs=[chat, state_msgs, state_mem, state_dynamic]
         )
 
-        def _repeat(ui_hist, msg_hist, mem_obj, dyn_state):
+        def _repeat(ui_hist, msg_hist, mem_obj, dyn_state, idle_enabled_flag, request: "gr.Request"):
+            session_id = _get_session_id(request)
+            if idle_enabled_flag:
+                idle_manager.enable(session_id)
+                idle_manager.mark_activity(session_id)
+            else:
+                idle_manager.disable(session_id)
             dyn_state = ensure_dynamic_state(dyn_state)
             if not msg_hist:
                 return ui_hist, msg_hist, mem_obj, dyn_state
@@ -2161,8 +2420,56 @@ def _init_gradio_app():
 
         btn_repeat.click(
             _repeat,
-            inputs=[chat, state_msgs, state_mem, state_dynamic],
+            inputs=[chat, state_msgs, state_mem, state_dynamic, idle_chat_enabled],
             outputs=[chat, state_msgs, state_mem, state_dynamic]
+        )
+
+        def _poll_idle(ui_hist, msg_hist, mem_obj, dyn_state,
+                       use_rag_flag, mem_en_flag,
+                       temp, topp, typical_val, rep_pen, ngram, diverse_flag, k_cand, max_tokens, refine_flag,
+                       idle_enabled_flag, request: "gr.Request"):
+            session_id = _get_session_id(request)
+            if idle_enabled_flag:
+                idle_manager.enable(session_id)
+            else:
+                idle_manager.disable(session_id)
+                return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+            event = idle_manager.pop_event(session_id)
+            if not event:
+                return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+            marker = event.get("marker")
+            if not marker:
+                return ui_hist, msg_hist, mem_obj, ensure_dynamic_state(dyn_state)
+            return _send(
+                marker,
+                ui_hist,
+                msg_hist,
+                mem_obj,
+                dyn_state,
+                use_rag_flag,
+                mem_en_flag,
+                temp,
+                topp,
+                typical_val,
+                rep_pen,
+                ngram,
+                diverse_flag,
+                k_cand,
+                max_tokens,
+                refine_flag,
+                idle_enabled_flag,
+                request,
+                event_context=event,
+            )
+
+        gr.Timer(interval=IDLE_TRIGGER_CHECK_INTERVAL).tick(
+            _poll_idle,
+            inputs=[chat, state_msgs, state_mem, state_dynamic,
+                    use_rag, mem_enabled,
+                    temperature, top_p, typical_slider, repetition_penalty, no_repeat_ngram,
+                    diverse, k_candidates, max_new, refine_enabled,
+                    idle_chat_enabled],
+            outputs=[chat, state_msgs, state_mem, state_dynamic],
         )
 
         # === 重载关键术语记忆 ===
