@@ -20,6 +20,7 @@ import time
 import random
 import re
 import hashlib
+import importlib
 from pathlib import Path
 from typing import List, Dict, Tuple, Any, Set, Optional, TYPE_CHECKING
 
@@ -146,7 +147,8 @@ FRAME_PROMPT_TEMPLATE = (
     "1.你的人物设定：{persona}\n"
     "2.你的历史记忆：{history}\n"
     "3.你的长期记忆：{long_term}\n"
-    "4.关键术语：{keywords}；用户（老师）输入：{user_input}"
+    "4.当前优香情绪：{emotion}\n"
+    "5.关键术语：{keywords}；用户（老师）输入：{user_input}"
 )
 
 
@@ -550,8 +552,60 @@ class KeywordMemory:
         return filtered
 
 
+DEFAULT_MOOD_LABEL = "平静"
+DEFAULT_ATTITUDE_LABEL = "亲切"
+
+_EMOTION_POSITIVE_TERMS = {
+    "喜欢", "爱", "期待", "开心", "高兴", "满意", "支持", "信任", "感激", "谢谢", "太好了", "真好", "厉害",
+}
+_EMOTION_WARM_TERMS = {
+    "抱抱", "安慰", "辛苦", "辛苦了", "慰问", "关心", "放心", "别怕", "温柔", "谢谢", "辛苦你", "拜托你",
+}
+_EMOTION_SAD_TERMS = {
+    "难过", "伤心", "沮丧", "低落", "烦", "疲惫", "累", "焦虑", "紧张", "担心", "郁闷", "失望", "委屈",
+}
+_EMOTION_ANGRY_TERMS = {
+    "生气", "气死", "烦死", "受不了", "讨厌", "怒", "恼", "火大", "很气", "不爽", "生氣",
+}
+_EMOTION_DISTANT_TERMS = {
+    "算了", "别管", "不用", "不用了", "不用你", "不用帮", "别说", "闭嘴", "滚", "离开", "别理",
+}
+
+
+def _default_affect(label: str) -> Dict[str, Any]:
+    now = int(time.time())
+    return {
+        "label": label,
+        "score": 0.0,
+        "updated_at": now,
+        "source": "default",
+    }
+
+
 def new_dynamic_state() -> Dict[str, Any]:
-    return {"turn": 0, "active": {}}
+    return {
+        "turn": 0,
+        "active": {},
+        "mood": _default_affect(DEFAULT_MOOD_LABEL),
+        "attitude": _default_affect(DEFAULT_ATTITUDE_LABEL),
+    }
+
+
+def _ensure_affect_record(state: Dict[str, Any], key: str, default_label: str) -> Dict[str, Any]:
+    if key not in state or not isinstance(state.get(key), dict):
+        state[key] = _default_affect(default_label)
+        return state[key]
+
+    record = state[key]
+    if "label" not in record or not isinstance(record["label"], str):
+        record["label"] = default_label
+    if "score" not in record or not isinstance(record.get("score"), (int, float)):
+        record["score"] = 0.0
+    if "updated_at" not in record or not isinstance(record.get("updated_at"), (int, float)):
+        record["updated_at"] = int(time.time())
+    if "source" not in record or not isinstance(record.get("source"), str):
+        record["source"] = "unknown"
+    return record
 
 
 def ensure_dynamic_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -561,6 +615,12 @@ def ensure_dynamic_state(state: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         return new_dynamic_state()
     if not isinstance(state["active"], dict):
         state["active"] = {}
+    try:
+        state["turn"] = int(state.get("turn", 0))
+    except Exception:
+        state["turn"] = 0
+    _ensure_affect_record(state, "mood", DEFAULT_MOOD_LABEL)
+    _ensure_affect_record(state, "attitude", DEFAULT_ATTITUDE_LABEL)
     return state
 
 
@@ -585,6 +645,183 @@ def collect_dynamic_keywords(state: Dict[str, Any]) -> List[str]:
     return texts
 
 
+def _normalize_affect_entry(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        label = value.get("label") or value.get("value") or value.get("text")
+        score_val = value.get("score")
+        if score_val is None:
+            for key in ("intensity", "confidence", "weight"):
+                if isinstance(value.get(key), (int, float)):
+                    score_val = value[key]
+                    break
+        result: Dict[str, Any] = {}
+        if isinstance(label, str) and label.strip():
+            result["label"] = label.strip()
+        if isinstance(score_val, (int, float)):
+            result["score"] = float(score_val)
+        if isinstance(value.get("source"), str):
+            result["source"] = value["source"]
+        return result
+    if isinstance(value, str) and value.strip():
+        return {"label": value.strip()}
+    if isinstance(value, (list, tuple)) and value:
+        label = str(value[0]).strip()
+        result: Dict[str, Any] = {}
+        if label:
+            result["label"] = label
+        if len(value) > 1 and isinstance(value[1], (int, float)):
+            result["score"] = float(value[1])
+        return result
+    return {}
+
+
+def _normalize_affect_result(raw: Any, source_name: str) -> Dict[str, Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: Dict[str, Dict[str, Any]] = {}
+    for key in ("mood", "attitude"):
+        if key in raw:
+            entry = _normalize_affect_entry(raw[key])
+            if entry:
+                entry.setdefault("source", source_name)
+                normalized[key] = entry
+    if "mood" not in normalized:
+        entry = _normalize_affect_entry(raw.get("mood_label"))
+        if entry:
+            if isinstance(raw.get("mood_score"), (int, float)):
+                entry["score"] = float(raw["mood_score"])
+            entry.setdefault("source", source_name)
+            normalized["mood"] = entry
+    if "attitude" not in normalized:
+        entry = _normalize_affect_entry(raw.get("attitude_label"))
+        if entry:
+            if isinstance(raw.get("attitude_score"), (int, float)):
+                entry["score"] = float(raw["attitude_score"])
+            entry.setdefault("source", source_name)
+            normalized["attitude"] = entry
+    return normalized
+
+
+def _run_external_emotion_classifier(text: str) -> Optional[Dict[str, Dict[str, Any]]]:
+    module_hints = []
+    env_hint = os.environ.get("YUKA_EMOTION_CLASSIFIER")
+    if env_hint:
+        module_hints.extend([hint.strip() for hint in env_hint.split(",") if hint.strip()])
+    module_hints.append("emotion_classifier")
+
+    for name in module_hints:
+        if not name:
+            continue
+        try:
+            module = importlib.import_module(name)
+        except ImportError:
+            continue
+        classify = getattr(module, "classify", None)
+        if not callable(classify):
+            continue
+        try:
+            raw = classify(text)
+        except Exception:
+            continue
+        normalized = _normalize_affect_result(raw, name)
+        if normalized:
+            return normalized
+    return None
+
+
+def _heuristic_affect_classification(text: str) -> Dict[str, Dict[str, Any]]:
+    stripped = (text or "").strip()
+    if not stripped:
+        return {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    positive = any(term in stripped for term in _EMOTION_POSITIVE_TERMS)
+    warm = any(term in stripped for term in _EMOTION_WARM_TERMS)
+    sad = any(term in stripped for term in _EMOTION_SAD_TERMS)
+    angry = any(term in stripped for term in _EMOTION_ANGRY_TERMS)
+    distant = any(term in stripped for term in _EMOTION_DISTANT_TERMS)
+
+    exclamation = stripped.count("！") + stripped.count("!")
+    question = stripped.count("？") + stripped.count("?")
+
+    if angry:
+        result["mood"] = {"label": "恼火", "score": -0.75}
+        result["attitude"] = {"label": "抵触", "score": -0.65}
+    elif sad:
+        result["mood"] = {"label": "低落", "score": -0.55}
+        result["attitude"] = {"label": "需要安慰", "score": 0.15}
+    elif distant:
+        result["mood"] = {"label": "冷淡", "score": -0.35}
+        result["attitude"] = {"label": "疏离", "score": -0.45}
+    elif positive or warm or exclamation >= 2:
+        result["mood"] = {"label": "愉悦", "score": 0.6}
+        result["attitude"] = {"label": "亲近", "score": 0.5}
+    elif is_small_talk(stripped):
+        result["mood"] = {"label": "轻松", "score": 0.35}
+        result["attitude"] = {"label": "友好", "score": 0.3}
+    elif question >= 1 and len(stripped) <= 48:
+        result["mood"] = {"label": "专注", "score": 0.2}
+        result["attitude"] = {"label": "求助", "score": 0.25}
+    elif "抱歉" in stripped or "不好意思" in stripped:
+        result["mood"] = {"label": "愧疚", "score": -0.2}
+        result["attitude"] = {"label": "歉意", "score": 0.35}
+
+    if not result and positive:
+        result["mood"] = {"label": "愉悦", "score": 0.45}
+        result["attitude"] = {"label": "亲近", "score": 0.4}
+
+    for entry in result.values():
+        entry["source"] = "heuristic"
+    return result
+
+
+def _apply_affect_update(state: Dict[str, Any], key: str, update: Dict[str, Any]) -> None:
+    record = _ensure_affect_record(
+        state,
+        key,
+        DEFAULT_MOOD_LABEL if key == "mood" else DEFAULT_ATTITUDE_LABEL,
+    )
+    if "label" in update and isinstance(update["label"], str) and update["label"].strip():
+        record["label"] = update["label"].strip()
+    if isinstance(update.get("score"), (int, float)):
+        score = float(update["score"])
+        record["score"] = max(-1.0, min(1.0, score))
+    if isinstance(update.get("source"), str):
+        record["source"] = update["source"].strip() or record.get("source", "heuristic")
+    record["updated_at"] = int(time.time())
+
+
+def _decay_affect(record: Dict[str, Any], default_label: str, factor: float = 0.2) -> None:
+    score = float(record.get("score", 0.0))
+    score *= (1.0 - factor)
+    if abs(score) < 0.12:
+        score = 0.0
+        record["label"] = default_label
+    record["score"] = score
+    record["updated_at"] = int(time.time())
+
+
+def _nudge_affect(record: Dict[str, Any], default_label: str, delta: float, positive_label: Optional[str] = None,
+                  negative_label: Optional[str] = None) -> None:
+    score = float(record.get("score", 0.0)) + delta
+    score = max(-1.0, min(1.0, score))
+    record["score"] = score
+    if score > 0.35 and positive_label:
+        record["label"] = positive_label
+    elif score < -0.35 and negative_label:
+        record["label"] = negative_label
+    elif abs(score) < 0.15:
+        record["label"] = default_label
+    record["updated_at"] = int(time.time())
+
+
+def _classify_user_affect(user_text: str) -> Dict[str, Dict[str, Any]]:
+    external = _run_external_emotion_classifier(user_text)
+    if external:
+        return external
+    return _heuristic_affect_classification(user_text)
+
+
 def advance_dynamic_state(state: Dict[str, Any], user_text: str, kb: KeywordMemory, enabled: bool) -> Tuple[Dict[str, Any], List[str]]:
     state = ensure_dynamic_state(state)
     state["turn"] = int(state.get("turn", 0)) + 1
@@ -595,9 +832,78 @@ def advance_dynamic_state(state: Dict[str, Any], user_text: str, kb: KeywordMemo
             rec["last_turn"] = state["turn"]
             if entry["text"] not in rec["texts"]:
                 rec["texts"].append(entry["text"])
+    affect_updates = _classify_user_affect(user_text)
+    if affect_updates:
+        if "mood" in affect_updates:
+            _apply_affect_update(state, "mood", affect_updates["mood"])
+        if "attitude" in affect_updates:
+            _apply_affect_update(state, "attitude", affect_updates["attitude"])
     _prune_dynamic_state(state)
     keywords = collect_dynamic_keywords(state) if enabled else []
     return state, keywords
+
+
+def adjust_dynamic_state_after_reply(state: Dict[str, Any], reply_text: str) -> Dict[str, Any]:
+    state = ensure_dynamic_state(state)
+    reply = (reply_text or "").strip()
+    mood_record = state["mood"]
+    attitude_record = state["attitude"]
+
+    _decay_affect(mood_record, DEFAULT_MOOD_LABEL)
+    _decay_affect(attitude_record, DEFAULT_ATTITUDE_LABEL)
+
+    if not reply:
+        return state
+
+    if "抱歉" in reply or "不好意思" in reply:
+        _nudge_affect(attitude_record, DEFAULT_ATTITUDE_LABEL, 0.25, positive_label="关切")
+        _nudge_affect(mood_record, DEFAULT_MOOD_LABEL, -0.15, negative_label="愧疚")
+    if "谢谢" in reply or "感谢" in reply:
+        _nudge_affect(attitude_record, DEFAULT_ATTITUDE_LABEL, 0.3, positive_label="感激")
+        _nudge_affect(mood_record, DEFAULT_MOOD_LABEL, 0.1, positive_label="愉悦")
+    if "放心" in reply or "别担心" in reply or "我在" in reply:
+        _nudge_affect(attitude_record, DEFAULT_ATTITUDE_LABEL, 0.2, positive_label="安抚")
+        _nudge_affect(mood_record, DEFAULT_MOOD_LABEL, 0.15, positive_label="笃定")
+    if reply.count("！") + reply.count("!") >= 2:
+        _nudge_affect(mood_record, DEFAULT_MOOD_LABEL, 0.2, positive_label="兴奋")
+    if "呵" in reply or "哼" in reply:
+        _nudge_affect(attitude_record, DEFAULT_ATTITUDE_LABEL, -0.1, negative_label="撒娇")
+
+    return state
+
+
+def _format_affect_value(record: Dict[str, Any], default_label: str) -> str:
+    label = record.get("label") or default_label
+    score = record.get("score")
+    ts = record.get("updated_at")
+    parts = [label]
+    if isinstance(score, (int, float)) and abs(score) > 1e-3:
+        parts.append(f"{score:+.2f}")
+    if isinstance(ts, (int, float)) and ts > 0:
+        try:
+            ts_text = time.strftime("%H:%M:%S", time.localtime(int(ts)))
+            parts.append(f"更新于{ts_text}")
+        except Exception:
+            pass
+    source = record.get("source")
+    if isinstance(source, str) and source and source not in {"default", "heuristic", "unknown"}:
+        parts.append(f"来源：{source}")
+    return "（" + "，".join(parts[1:]) + "）" if len(parts) > 1 else parts[0]
+
+
+def render_dynamic_emotion_summary(state: Dict[str, Any]) -> str:
+    state = ensure_dynamic_state(state)
+    mood_label = state["mood"].get("label") or DEFAULT_MOOD_LABEL
+    attitude_label = state["attitude"].get("label") or DEFAULT_ATTITUDE_LABEL
+    mood_desc = f"心情：{mood_label}"
+    attitude_desc = f"对老师的态度：{attitude_label}"
+    mood_meta = _format_affect_value(state["mood"], DEFAULT_MOOD_LABEL)
+    attitude_meta = _format_affect_value(state["attitude"], DEFAULT_ATTITUDE_LABEL)
+    if mood_meta.startswith("（"):
+        mood_desc += mood_meta
+    if attitude_meta.startswith("（"):
+        attitude_desc += attitude_meta
+    return f"{mood_desc}；{attitude_desc}"
 
 
 # =============== 会话记忆持久化 ===============
@@ -612,17 +918,26 @@ def new_memory(mem_id: str) -> Dict:
         "turns": [],  # [{u, a}]
         "block_summaries": [],
         "sparse": [],
-        "super_summary": ""
+        "super_summary": "",
+        "dynamic_state": new_dynamic_state()
     }
 
 def load_memory(mem_id: str) -> Dict:
     p = mem_path(mem_id)
     if p.exists():
         with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return new_memory(mem_id)
+            mem = json.load(f)
+    else:
+        mem = new_memory(mem_id)
+    if "dynamic_state" not in mem:
+        mem["dynamic_state"] = new_dynamic_state()
+    else:
+        mem["dynamic_state"] = ensure_dynamic_state(mem.get("dynamic_state"))
+    return mem
+
 
 def save_memory(mem: Dict):
+    mem["dynamic_state"] = ensure_dynamic_state(mem.get("dynamic_state"))
     with open(mem_path(mem["id"]), "w", encoding="utf-8") as f:
         json.dump(mem, f, ensure_ascii=False, indent=2)
 
@@ -1426,16 +1741,19 @@ def generate_diverse(msgs, k_candidates, history_ui_recent, **gen_kwargs):
 
 # =============== 构造消息 ===============
 def format_system_prompt(persona_text: str, history_text: str, long_term_text: str,
-                         keyword_texts: List[str], user_input: str) -> str:
+                         keyword_texts: List[str], dynamic_state: Dict[str, Any],
+                         user_input: str) -> str:
     persona = persona_text.strip() if persona_text else "（未设置人物设定）"
     history = history_text.strip() if history_text else "（暂无历史记忆）"
     long_term = long_term_text.strip() if long_term_text else "（暂无长期记忆）"
     keywords = "；".join(keyword_texts) if keyword_texts else "（暂无关键术语）"
     user = user_input.strip() if user_input else "（空输入）"
+    emotion = render_dynamic_emotion_summary(dynamic_state)
     return FRAME_PROMPT_TEMPLATE.format(
         persona=persona,
         history=history,
         long_term=long_term,
+        emotion=emotion,
         keywords=keywords,
         user_input=user,
     )
@@ -1443,9 +1761,9 @@ def format_system_prompt(persona_text: str, history_text: str, long_term_text: s
 
 def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
                    persona_text: str, history_text: str, long_term_text: str,
-                   keyword_texts: List[str]) -> List[Dict[str, str]]:
+                   keyword_texts: List[str], dynamic_state: Dict[str, Any]) -> List[Dict[str, str]]:
     msgs: List[Dict[str, str]] = []
-    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, user_text)
+    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, dynamic_state, user_text)
     msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
         msgs.append(m)
@@ -1456,7 +1774,7 @@ def build_messages(history_msgs: List[Dict[str, str]], user_text: str,
 def build_messages_for_continue(history_msgs: List[Dict[str, str]],
                                 ui_hist: List[Tuple[str, str]],
                                 persona_text: str, history_text: str, long_term_text: str,
-                                keyword_texts: List[str]) -> Tuple[List[Dict[str, str]], str]:
+                                keyword_texts: List[str], dynamic_state: Dict[str, Any]) -> Tuple[List[Dict[str, str]], str]:
     """不把“继续”显示到UI；仅构造临时 msgs 以续写"""
     frag_pairs = ui_hist[-3:] if ui_hist else []
     lines = []
@@ -1468,7 +1786,7 @@ def build_messages_for_continue(history_msgs: List[Dict[str, str]],
     recent_frag = "\n".join(lines[-12:])
     hidden_user = "继续（不要重复开场白，直接承接你上一条的语气与内容展开；如需列点，从上次编号往下接）。\n【最近片段】\n" + recent_frag
 
-    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, hidden_user)
+    sys_content = format_system_prompt(persona_text, history_text, long_term_text, keyword_texts, dynamic_state, hidden_user)
     msgs: List[Dict[str, str]] = []
     msgs.append({"role": "system", "content": sys_content})
     for m in history_msgs:
@@ -1521,9 +1839,10 @@ def _init_gradio_app():
         def do_load_mem(mem_id_text):
             mem = load_memory(mem_id_text or DEFAULT_MEM_ID)
             ui = [[t["u"], t["a"]] for t in mem["turns"][-10:]]
+            dyn_state = ensure_dynamic_state(mem.get("dynamic_state"))
             gr.Info(f"已加载记忆：{mem_id_text or DEFAULT_MEM_ID}")
-            return mem, ui
-        btn_load_mem.click(do_load_mem, inputs=[mem_id], outputs=[state_mem, chat])
+            return mem, ui, dyn_state
+        btn_load_mem.click(do_load_mem, inputs=[mem_id], outputs=[state_mem, chat, state_dynamic])
 
         def do_save_mem(mem_obj, mem_id_text):
             mem_obj["id"] = mem_id_text or DEFAULT_MEM_ID
@@ -1597,7 +1916,7 @@ def _init_gradio_app():
                 keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
 
             msgs = build_messages(msg_hist or [{"role": "system", "content": "(hidden)"}],
-                                  user_input, persona_text, history_text, long_term_text, keywords_for_prompt)
+                                  user_input, persona_text, history_text, long_term_text, keywords_for_prompt, dyn_state)
             max_new = int(max_tokens)
             min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
             gen_kwargs = dict(
@@ -1649,6 +1968,7 @@ def _init_gradio_app():
                         history_text,
                         long_term_text,
                         keywords_for_prompt,
+                        dyn_state,
                     )
                     more = _sample_reply(msgs_continue, temp_ui)
                     if not more or violates_rules(more) or not more.strip():
@@ -1678,6 +1998,9 @@ def _init_gradio_app():
             msg_hist = temp_msgs
             if len(msg_hist) > 13:
                 msg_hist = msg_hist[:1] + msg_hist[-12:]
+
+            dyn_state = adjust_dynamic_state_after_reply(dyn_state, full_reply)
+            mem_obj["dynamic_state"] = dyn_state
 
             if mem_en_flag:
                 mem_obj["turns"].append({"u": user_input, "a": reply})
@@ -1749,6 +2072,7 @@ def _init_gradio_app():
                 history_text,
                 long_term_text,
                 keywords_for_prompt,
+                dyn_state,
             )
             max_new = int(max_tokens)
             min_new = min(DEFAULT_MIN_NEW_TOKENS, max(1, max_new - 1)) if max_new > 1 else 1
@@ -1795,6 +2119,11 @@ def _init_gradio_app():
                 else:
                     mem_obj["turns"].append({"u": "", "a": extract_first_sentence(more)})
                 refresh_memory_layers(mem_obj)
+
+            dyn_state = adjust_dynamic_state_after_reply(dyn_state, truncated)
+            mem_obj["dynamic_state"] = dyn_state
+
+            if mem_en_flag:
                 save_memory(mem_obj)
 
             return ui_hist, msg_hist, mem_obj, dyn_state
