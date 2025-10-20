@@ -341,7 +341,7 @@ def refine_short(text: str, tokenizer, model) -> str:
             max_new_tokens=96,
             use_cache=True,
             pad_token_id=getattr(tokenizer, "pad_token_id", None),
-            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+            eos_token_id=EOS_IDS if 'EOS_IDS' in globals() and EOS_IDS else getattr(tokenizer, "eos_token_id", None),
         )
     gen = tokenizer.decode(out[0][ids.shape[-1]:], skip_special_tokens=True)
     refined = _limit_sentences(_sanitize(gen), 2, 1)
@@ -448,10 +448,22 @@ def load_model():
     if tok.eos_token_id is not None:
         mdl.config.eos_token_id = tok.eos_token_id
 
-    return tok, mdl
+    # ===== 多 EOS：遇到对话终止标记更快收尾 =====
+    eos_ids = []
+    if tok.eos_token_id is not None:
+        eos_ids.append(tok.eos_token_id)
+    for sp in ["<|im_end|>", "<|endoftext|>"]:
+        try:
+            tid = tok.convert_tokens_to_ids(sp)
+            if isinstance(tid, int) and tid >= 0 and tid not in eos_ids:
+                eos_ids.append(tid)
+        except Exception:
+            pass
+
+    return tok, mdl, eos_ids
 
 # ====== 初始化 ======
-tokenizer, model = load_model()
+tokenizer, model, EOS_IDS = load_model()
 
 BAN_STRINGS = ["http", "https", "www.", "sourceMappingURL", "#", "Teacher", "teacher", "sensei"]
 BAD_WORDS_IDS = [ids for s in BAN_STRINGS if (ids := tokenizer.encode(s, add_special_tokens=False))]
@@ -562,6 +574,27 @@ def generate_one(
     min_new_tokens=0,
     seed=None
 ) -> str:
+    # ---- 新增：采样参数统一门面 ----
+    def _resolve_sampling(temperature: float, top_p: float, typical_p: Optional[float]):
+        """
+        - clamp: 防越界
+        - 典型采样与 Top-p 二选一
+        - 近似确定性时自动改为贪心（do_sample=False）
+        """
+        t = float(max(0.05, min(temperature, 1.5)))     # 温度下限 0.05，避免数值不稳
+        use_typical = (typical_p is not None) and (float(typical_p) < 0.999)
+        if use_typical:
+            tp = None
+            typ = float(max(0.50, min(typical_p, 0.999)))  # 典型采样有效区间
+        else:
+            tp = float(max(0.10, min(top_p, 1.0)))
+            typ = None
+
+        # 采样 or 贪心：当几乎没有随机性时切到贪心更稳
+        almost_greedy = (t <= 0.12) and (not use_typical) and (tp >= 0.999 - 1e-6)
+        do_sample = not almost_greedy
+        return t, tp, typ, do_sample
+
     if seed is not None:
         torch.manual_seed(seed); random.seed(seed)
 
@@ -572,23 +605,27 @@ def generate_one(
         min_new = max(1, max_new_tokens - 1)
 
     with torch.inference_mode():
+        t, tp, typ, do_sample = _resolve_sampling(temperature, top_p, typical_p)
+
         gen_kwargs = dict(
             max_new_tokens=int(max_new_tokens),
             min_new_tokens=max(1, int(min_new)) if max_new_tokens else None,
-            do_sample=True,
-            temperature=float(temperature),
+            do_sample=do_sample,
+            temperature=t,
             repetition_penalty=float(repetition_penalty),
             no_repeat_ngram_size=int(no_repeat_ngram_size),
             length_penalty=float(length_penalty),
             bad_words_ids=BAD_WORDS_IDS,
             use_cache=True,
             pad_token_id=getattr(tokenizer, "pad_token_id", None),
-            eos_token_id=getattr(tokenizer, "eos_token_id", None),
+            # ★ 用多 EOS：列表形式让模型更早停在对话边界
+            eos_token_id=EOS_IDS if EOS_IDS else getattr(tokenizer, "eos_token_id", None),
         )
-        if typical_p is not None and float(typical_p) < 0.999:
-            gen_kwargs["typical_p"] = float(typical_p)
-        else:
-            gen_kwargs["top_p"] = float(top_p)
+        if do_sample:
+            if typ is not None:
+                gen_kwargs["typical_p"] = typ
+            else:
+                gen_kwargs["top_p"] = tp
 
         out = model.generate(
             **inputs,
@@ -685,9 +722,9 @@ with gr.Blocks(title="yuuka-ai") as demo:
     with gr.Row():
         temperature = gr.Slider(0.2, 1.2, value=DEFAULT_TEMPERATURE, step=0.05, label="温度")
         top_p = gr.Slider(0.5, 1.0, value=DEFAULT_TOP_P, step=0.01, label="Top-p")
-        typical_slider = gr.Slider(0.5, 1.0, value=0.95, step=0.01, label="typical_p（与 Top-p 二选一）")
+        typical_slider = gr.Slider(0.5, 1.0, value=1.0, step=0.01, label="typical_p（=1 关闭；与 Top-p 二选一）")
         repetition_penalty = gr.Slider(1.0, 1.3, value=1.2, step=0.01, label="重复惩罚")
-        no_repeat_ngram = gr.Slider(0, 8, value=6, step=1, label="no_repeat_ngram_size")
+        no_repeat_ngram = gr.Slider(0, 8, value=4, step=1, label="no_repeat_ngram_size")
 
     with gr.Row():
         diverse = gr.Checkbox(label="多样化输出（候选采样）", value=True)
