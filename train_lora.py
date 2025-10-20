@@ -26,6 +26,7 @@ from transformers import (
     AutoTokenizer,
     BitsAndBytesConfig,
     Trainer,
+    TrainerCallback,
     TrainingArguments,
 )
 
@@ -219,6 +220,12 @@ class ChatTemplateCollator:
 
 
 # ===================== 自定义 Trainer =====================
+class CudaEmptyCacheCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 class CustomTrainer(Trainer):
     def __init__(
         self,
@@ -347,6 +354,12 @@ def make_training_args(args, has_val: bool, num_workers: int):
         kw["report_to"] = []
     if "label_smoothing_factor" in params and args.label_smoothing > 0:
         kw["label_smoothing_factor"] = args.label_smoothing
+    if "per_device_eval_batch_size" in params:
+        kw["per_device_eval_batch_size"] = 1
+    if "eval_accumulation_steps" in params:
+        kw["eval_accumulation_steps"] = 1
+    if "prediction_loss_only" in params:
+        kw["prediction_loss_only"] = True
 
     # 评估策略（多版本兼容）
     if has_val:
@@ -477,6 +490,7 @@ def main():
         length_prior=args.length_prior,
         token_weights=token_weights_map,
         label_smoothing=args.label_smoothing,
+        callbacks=[CudaEmptyCacheCallback()],
     )
     if "processing_class" in trainer_sig.parameters:
         trainer = CustomTrainer(processing_class=tokenizer, **base_kwargs)
