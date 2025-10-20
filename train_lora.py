@@ -33,6 +33,7 @@ from transformers import (
 DEFAULT_MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 DEFAULT_DATA_DIR = Path("data/processed")
 DEFAULT_OUTPUT_DIR = Path("models/yuuka_qwen_lora")
+DEFAULT_PERSONA_FILE = Path("memory/persona_yuuka.txt")
 MAX_SEQ_LEN = 1024
 
 
@@ -274,7 +275,12 @@ def parse_args():
     p.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN, help="最大序列长度")
     p.add_argument("--length-prior", type=float, default=1.0, help="长度偏好指数（>1 偏好更长回答）")
     p.add_argument("--persona-prefix", type=str, default=None, help="可选：追加到对话的 persona 文本")
-    p.add_argument("--persona-file", type=Path, default=None, help="可选：人设文本文件；与 persona-prefix 互斥")
+    p.add_argument(
+        "--persona-file",
+        type=Path,
+        default=DEFAULT_PERSONA_FILE,
+        help="人设文本文件，默认使用 memory/persona_yuuka.txt",
+    )
     p.add_argument("--persona-apply", choices=["prompt", "completion", "both"], default="prompt", help="人设注入位置（prompt=system 提示，completion=拼接到最终回答）")
     p.add_argument("--persona-separator", type=str, default="\n\n", help="人设与原对话之间的分隔符")
     p.add_argument("--token-weights", type=str, default="", help='关键词权重，如 "预算=1.5,报销=1.5"')
@@ -349,40 +355,38 @@ def main():
         data_files["validation"] = str(val_path)
     dataset = load_dataset("json", data_files=data_files)
 
-    # 可选：追加 persona 文本
-    persona_text: Optional[str] = None
-    if args.persona_file and Path(args.persona_file).exists():
-        persona_text = Path(args.persona_file).read_text(encoding="utf-8").strip()
-    elif args.persona_prefix:
-        persona_text = args.persona_prefix.strip()
+    persona_path = Path(args.persona_file) if args.persona_file else DEFAULT_PERSONA_FILE
+    if not persona_path.exists():
+        raise FileNotFoundError(f"未找到人设文件: {persona_path}")
 
-    if persona_text:
-        print("[INFO] 在数据集中追加 Persona 文本以强化语气/口癖")
-        sep = args.persona_separator
+    raw_persona_text = persona_path.read_text(encoding="utf-8").strip()
+    persona_text_parts = [line.strip() for line in raw_persona_text.splitlines() if line.strip()]
+    persona_text = " ".join(persona_text_parts)
+    if args.persona_prefix:
+        persona_text = f"{args.persona_prefix.strip()} {persona_text}".strip()
 
-        def _add_persona(ex):
-            msgs = [dict(m) for m in ex.get("messages", [])]
-            if not msgs:
-                return ex
+    def _build_messages(ex: Dict[str, Any]) -> Dict[str, Any]:
+        context = str(ex.get("prompt", "")).strip()
+        completion = str(ex.get("completion", "")).strip()
+        if not context or not completion:
+            raise ValueError("每条样本必须包含 prompt 与 completion 字段")
 
-            if args.persona_apply in {"prompt", "both"}:
-                if msgs[0].get("role") == "system":
-                    merged = f"{persona_text}{sep}{msgs[0].get('content', '')}".strip()
-                    msgs[0] = {"role": "system", "content": merged}
-                else:
-                    msgs = [{"role": "system", "content": persona_text}] + msgs
+        prompt_text = (
+            "你是早濑优香，你的基础人设是（"
+            f"{persona_text}"
+            "），先前的对话内容为“"
+            f"{context}"
+            "”，请你继续对话："
+        )
 
-            if args.persona_apply in {"completion", "both"} and msgs:
-                last = dict(msgs[-1])
-                if last.get("role") == "assistant":
-                    last["content"] = f"{persona_text}{sep}{last.get('content', '')}"
-                    msgs[-1] = last
+        new_ex = dict(ex)
+        new_ex["messages"] = [
+            {"role": "user", "content": prompt_text},
+            {"role": "assistant", "content": completion},
+        ]
+        return new_ex
 
-            new_ex = dict(ex)
-            new_ex["messages"] = msgs
-            return new_ex
-
-        dataset = dataset.map(_add_persona)
+    dataset = dataset.map(_build_messages)
 
     # 解析关键词权重
     token_weights_map: Dict[str, float] = {}
