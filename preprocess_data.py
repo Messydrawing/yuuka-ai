@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-预处理优香对话数据，生成训练用JSONL（prompt / completion）。
+预处理优香对话数据，生成训练用 JSONL，其中每条样本包含可直接传入
+`tokenizer.apply_chat_template` 的 `messages` 列表。
 
-1) 原生支持 ModelScope/ChatML 常见格式：顶层 {"messages": [...]}，其中每个turn含 {"role","content"}。
+1) 原生支持 ModelScope/ChatML 常见格式：顶层 {"messages": [...]}，其中每个 turn 含 {"role","content"}。
 2) 统一角色：'user'/'老师' → '用户'；'assistant'/'优香' → '优香'。
 3) 默认使用“滑动窗口切片”产样：凡是以“优香”作结且前面至少有一条“用户”，都会产一条样本（受 min/max-turn 约束）。
    - 如需旧行为（只取每段对话的最后一问一答），将 --window-mode 设为 last。
@@ -72,7 +73,7 @@ def save_jsonl(path: Path, items: List[Any]):
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
 
-def split_dataset(samples: List[Dict[str, str]], val_ratio: float, seed: int) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+def split_dataset(samples: List[Dict[str, Any]], val_ratio: float, seed: int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     rnd = random.Random(seed)
     rnd.shuffle(samples)
     if not samples:
@@ -221,9 +222,9 @@ def build_samples(
     memory_event_count: int,
     window_mode: str,
     rng: random.Random
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
 
-    samples: List[Dict[str, str]] = []
+    samples: List[Dict[str, Any]] = []
 
     # 尝试读取人设文本（可选）
     persona_text_full = ""
@@ -232,8 +233,8 @@ def build_samples(
         persona_text_full = persona_file_path.read_text(encoding="utf-8").strip()
     persona_lines_all = [ln.strip() for ln in persona_text_full.splitlines() if ln.strip()] if persona_text_full else []
 
-    def make_persona_prompt(prompt_lines: List[str]) -> str:
-        """构造 persona + 对话 形式的 prompt"""
+    def make_persona_prompt() -> str:
+        """构造 persona / 记忆 形式的系统提示。"""
         sections: List[str] = []
         if persona_lines_all:
             sections.append(persona_lines_all[0])  # 概述
@@ -275,7 +276,10 @@ def build_samples(
             "（若涉及预算或报销，请先盘点再给建议。）"
         ])
 
-        return f"{'\n'.join(sections)}\n对话记录：\n" + "\n".join(prompt_lines) + "\n优香："
+        return "\n".join(sections)
+
+    def speaker_to_role(speaker: str) -> str:
+        return "assistant" if speaker == "优香" else "user"
 
     # 遍历每段对话，产样
     for conv in convs:
@@ -316,11 +320,13 @@ def build_samples(
             if not is_meaningful_completion(completion_text):
                 continue
 
-            # 构建 prompt/completion
-            prompt_lines: List[str] = []
+            # 构建消息上下文
+            context_messages: List[Dict[str, str]] = []
             for t in seg[:-1]:
-                prompt_lines.append(f"{t['speaker']}：{t['text']}")
-            prompt_base = "\n".join(prompt_lines) + "\n优香："
+                context_messages.append({
+                    "role": speaker_to_role(t["speaker"]),
+                    "content": t["text"],
+                })
 
             # 可选：并入上一句优香
             if merge_prev_prob > 0 and rng.random() < merge_prev_prob:
@@ -345,12 +351,14 @@ def build_samples(
                     continue
 
             # 常规样本
-            samples.append({"prompt": prompt_base, "completion": completion_text})
+            base_messages = context_messages + [{"role": "assistant", "content": completion_text}]
+            samples.append({"messages": base_messages})
 
             # persona 样本（概率触发）
             if rng.random() < persona_prob:
-                persona_full_prompt = make_persona_prompt(prompt_lines)
-                samples.append({"prompt": persona_full_prompt, "completion": completion_text})
+                persona_full_prompt = make_persona_prompt()
+                persona_messages = [{"role": "system", "content": persona_full_prompt}] + base_messages
+                samples.append({"messages": persona_messages})
 
     return samples
 

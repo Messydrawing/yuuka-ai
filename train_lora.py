@@ -7,7 +7,7 @@
 - 基座：Qwen/Qwen2.5-7B-Instruct（4bit QLoRA）。
 - 兼容 transformers 多版本：evaluation_strategy / eval_strategy / evaluate_during_training / do_eval 自适应。
 - 自定义 Trainer：token 级加权、长度偏好、（若可用则）label smoothing。
-- Collator：仅对 completion 计算 loss；右侧 padding；末尾自动 EOS。
+- Collator：以 chat template 方式拼接 messages，仅对最终 assistant 回复计算 loss。
 - LoRA 目标自动适配（q/k/v/o + gate/up/down_proj；兼容 GLM 命名）。
 - Windows 友好：dataloader_num_workers=0；bitsandbytes 4bit 已配置。
 """
@@ -16,7 +16,7 @@ import argparse
 import platform
 import inspect
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 
 import torch
 from datasets import load_dataset
@@ -111,28 +111,51 @@ def load_model(model_name: str):
 
 
 # ===================== Data Collator =====================
-class PromptCompletionCollator:
-    """将 prompt 与 completion 拼接，仅对 completion 计算 loss；右侧 padding；末尾追加 EOS。"""
+class ChatTemplateCollator:
+    """使用 chat template 构造输入，仅对最后一条 assistant 回复计算 loss。"""
+
     def __init__(self, tokenizer, max_len: int):
         self.tok = tokenizer
         self.max_len = max_len
         self.pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         self.eos_id = tokenizer.eos_token_id
+        self.chat_template = getattr(tokenizer, "chat_template", None)
 
-    def _encode(self, text: str) -> List[int]:
+    def _encode_text(self, text: str) -> List[int]:
         if not text:
             return []
-        return self.tok.encode(text, add_special_tokens=False)
+        return self.tok(text, add_special_tokens=False)["input_ids"]
 
-    def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+    def _build_prompt_ids(self, messages: List[Dict[str, str]]) -> List[int]:
+        if not messages:
+            raise ValueError("每条样本至少需要一条上下文消息（非 assistant）。")
+        normalized = []
+        for msg in messages:
+            role = str(msg.get("role") or "")
+            content = str(msg.get("content") or "")
+            normalized.append({"role": role, "content": content})
+        prompt_text = self.tok.apply_chat_template(
+            normalized,
+            tokenize=False,
+            add_generation_prompt=True,
+            chat_template=self.chat_template,
+        )
+        return self._encode_text(prompt_text)
+
+    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         input_id_list, attention_mask_list, labels_list, completion_lengths = [], [], [], []
 
         for ex in batch:
-            prompt = ex["prompt"]
-            completion = ex["completion"]
+            messages = ex.get("messages")
+            if not isinstance(messages, list) or not messages:
+                raise ValueError("样本缺少 messages 字段或为空。")
+            last_msg = messages[-1]
+            if str(last_msg.get("role")) != "assistant":
+                raise ValueError("最后一条消息必须是 assistant 回复。")
 
-            prompt_ids = self._encode(prompt)
-            completion_ids = self._encode(completion)
+            context_messages = messages[:-1]
+            prompt_ids = self._build_prompt_ids(context_messages)
+            completion_ids = self._encode_text(str(last_msg.get("content") or ""))
             if self.eos_id is not None:
                 completion_ids = completion_ids + [self.eos_id]
 
@@ -151,7 +174,7 @@ class PromptCompletionCollator:
             labels_list.append(labels)
             completion_lengths.append(comp_len)
 
-        max_length = max(len(x) for x in input_id_list)
+        max_length = max(len(x) for x in input_id_list) if input_id_list else 0
         padded_ids, padded_mask, padded_labels = [], [], []
         for ids, mask, labels in zip(input_id_list, attention_mask_list, labels_list):
             pad_len = max_length - len(ids)
@@ -250,9 +273,9 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-5, help="学习率")
     p.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN, help="最大序列长度")
     p.add_argument("--length-prior", type=float, default=1.0, help="长度偏好指数（>1 偏好更长回答）")
-    p.add_argument("--persona-prefix", type=str, default=None, help="可选：在 prompt/completion 前附加的人设文本")
+    p.add_argument("--persona-prefix", type=str, default=None, help="可选：追加到对话的 persona 文本")
     p.add_argument("--persona-file", type=Path, default=None, help="可选：人设文本文件；与 persona-prefix 互斥")
-    p.add_argument("--persona-apply", choices=["prompt", "completion", "both"], default="prompt", help="人设注入位置")
+    p.add_argument("--persona-apply", choices=["prompt", "completion", "both"], default="prompt", help="人设注入位置（prompt=system 提示，completion=拼接到最终回答）")
     p.add_argument("--persona-separator", type=str, default="\n\n", help="人设与原对话之间的分隔符")
     p.add_argument("--token-weights", type=str, default="", help='关键词权重，如 "预算=1.5,报销=1.5"')
     p.add_argument("--label-smoothing", type=float, default=0.02, help="若本地 PyTorch 支持则启用")
@@ -338,11 +361,25 @@ def main():
         sep = args.persona_separator
 
         def _add_persona(ex):
-            new_ex = dict(ex)
+            msgs = [dict(m) for m in ex.get("messages", [])]
+            if not msgs:
+                return ex
+
             if args.persona_apply in {"prompt", "both"}:
-                new_ex["prompt"] = f"{persona_text}{sep}{ex['prompt']}"
-            if args.persona_apply in {"completion", "both"}:
-                new_ex["completion"] = f"{persona_text}{sep}{ex['completion']}"
+                if msgs[0].get("role") == "system":
+                    merged = f"{persona_text}{sep}{msgs[0].get('content', '')}".strip()
+                    msgs[0] = {"role": "system", "content": merged}
+                else:
+                    msgs = [{"role": "system", "content": persona_text}] + msgs
+
+            if args.persona_apply in {"completion", "both"} and msgs:
+                last = dict(msgs[-1])
+                if last.get("role") == "assistant":
+                    last["content"] = f"{persona_text}{sep}{last.get('content', '')}"
+                    msgs[-1] = last
+
+            new_ex = dict(ex)
+            new_ex["messages"] = msgs
             return new_ex
 
         dataset = dataset.map(_add_persona)
@@ -370,7 +407,7 @@ def main():
         if token_weights_map:
             print(f"[INFO] 关键词加权: {token_weights_map}")
 
-    collator = PromptCompletionCollator(tokenizer, max_len=args.max_seq_len)
+    collator = ChatTemplateCollator(tokenizer, max_len=args.max_seq_len)
     has_val = "validation" in dataset
     num_workers = 0 if platform.system().lower().startswith("win") else 2
     training_args = make_training_args(args, has_val=has_val, num_workers=num_workers)
