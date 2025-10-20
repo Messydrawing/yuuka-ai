@@ -3,6 +3,8 @@ import sys
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def import_app_module():
     os.environ.setdefault("YUKA_SKIP_MODEL_LOAD", "1")
@@ -59,3 +61,30 @@ def test_build_memory_context_renders_attitude_line():
     assert "保持耐心与支持" in context_text
     assert "关系进展要点" in context_text
     assert "约定明日提交初稿" in context_text
+
+
+def test_keyword_memory_vector_search(tmp_path):
+    app = import_app_module()
+    if getattr(app, "np", None) is None:
+        pytest.skip("numpy is required for vector search")
+
+    kb_file = tmp_path / "memory.jsonl"
+    kb_file.write_text("", encoding="utf-8")
+    km = app.KeywordMemory(kb_file)
+
+    mem = app.new_memory("session")
+    mem["turns"] = [
+        {"u": "老师提醒预算审核进度，需要今晚提交调整方案", "a": "优香确认会在晚上十点前整理预算明细"},
+        {"u": "老师追问报销凭证是否齐全", "a": "优香表示欠缺一张交通票据"},
+    ]
+    mem["block_summaries"].append({
+        "start": 0,
+        "end": 1,
+        "summary": "老师与优香对预算审核进行梳理，确认今晚提交调整方案并补齐报销凭证",
+    })
+    km.queue_memory_fragments(mem)
+    km.flush_pending(force=True)
+
+    hits = km.search_similar_fragments("预算审核进度怎么样了？", top_k=2, min_score=0.0)
+    assert hits
+    assert any("预算" in (hit.get("label") or hit.get("content") or "") for hit in hits)
