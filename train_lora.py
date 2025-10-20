@@ -111,6 +111,33 @@ def load_model(model_name: str):
     return model
 
 
+def get_model_output_vocab_size(model) -> Optional[int]:
+    """获取模型输出层的词表大小（若可用）。"""
+    if model is None or not hasattr(model, "get_output_embeddings"):
+        return None
+
+    try:
+        output_embeddings = model.get_output_embeddings()
+    except Exception:
+        return None
+
+    if output_embeddings is None:
+        return None
+
+    weight = getattr(output_embeddings, "weight", None)
+    if weight is not None:
+        try:
+            return int(weight.shape[0])
+        except Exception:
+            pass
+
+    out_features = getattr(output_embeddings, "out_features", None)
+    if isinstance(out_features, int):
+        return out_features
+
+    return None
+
+
 # ===================== Data Collator =====================
 class ChatTemplateCollator:
     """使用 chat template 构造输入，仅对最后一条 assistant 回复计算 loss。"""
@@ -210,7 +237,9 @@ class CustomTrainer(Trainer):
             raise RuntimeError("Neither tokenizer nor processing_class is available for CustomTrainer.")
 
         # 词表权重（关键词加权）
-        vocab_size = len(self._proc)
+        vocab_size = get_model_output_vocab_size(self.model)
+        if vocab_size is None:
+            vocab_size = len(self._proc)
         weight_tensor = torch.ones(vocab_size)
         if token_weights:
             for token_str, factor in token_weights.items():
@@ -348,6 +377,14 @@ def main():
 
     tokenizer = get_tokenizer(args.model_name)
     model = load_model(args.model_name)
+
+    model_vocab = get_model_output_vocab_size(model)
+    if model_vocab is not None and model_vocab != len(tokenizer):
+        try:
+            model.resize_token_embeddings(len(tokenizer))
+            print(f"[INFO] resize_token_embeddings to {len(tokenizer)}")
+        except Exception as e:
+            print(f"[WARN] resize_token_embeddings failed: {e}")
 
     data_files = {"train": str(args.data_dir / "train.jsonl")}
     val_path = args.data_dir / "val.jsonl"
