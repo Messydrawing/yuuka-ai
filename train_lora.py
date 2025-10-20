@@ -45,13 +45,15 @@ def get_tokenizer(model_name: str):
         trust_remote_code=True,
         local_files_only=False,
     )
-    # 设置 pad_token
+
+    # 设置 pad_token，并在必要时追加特殊 token
     if tok.pad_token is None:
         if tok.eos_token:
             tok.pad_token = tok.eos_token
         else:
+            tok.add_special_tokens({"additional_special_tokens": ["<pad>"]})
             tok.pad_token = "<pad>"
-            tok._add_tokens([tok.pad_token])
+
     tok.padding_side = "right"
     return tok
 
@@ -392,12 +394,19 @@ def main():
     model = load_model(args.model_name)
 
     model_vocab = get_model_output_vocab_size(model)
-    if model_vocab is not None and model_vocab != len(tokenizer):
-        try:
-            model.resize_token_embeddings(len(tokenizer))
-            print(f"[INFO] resize_token_embeddings to {len(tokenizer)}")
-        except Exception as e:
-            print(f"[WARN] resize_token_embeddings failed: {e}")
+    tok_len = len(tokenizer)
+    if model_vocab is not None:
+        if tok_len > model_vocab:
+            try:
+                model.resize_token_embeddings(tok_len)
+                print(f"[INFO] resize_token_embeddings to {tok_len}")
+            except Exception as e:
+                print(f"[WARN] resize_token_embeddings failed: {e}")
+        elif tok_len < model_vocab:
+            print(
+                f"[WARN] tokenizer length ({tok_len}) is smaller than model vocab ({model_vocab})."
+                " 推理时请确保基座模型与微调所用分词器版本一致，或在推理端加载本次导出的 tokenizer。"
+            )
 
     data_files = {"train": str(args.data_dir / "train.jsonl")}
     val_path = args.data_dir / "val.jsonl"
@@ -500,7 +509,8 @@ def main():
     trainer.train()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    trainer.model.save_pretrained(args.output_dir)
+    peft_state_dict = trainer.model.get_peft_model_state_dict()
+    trainer.model.save_pretrained(args.output_dir, state_dict=peft_state_dict, safe_serialization=True)
     tokenizer.save_pretrained(args.output_dir)
     print(f"[DONE] LoRA 模型已保存至: {args.output_dir}")
 
