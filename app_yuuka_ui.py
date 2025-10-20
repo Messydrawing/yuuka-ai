@@ -19,8 +19,22 @@ import json
 import time
 import random
 import re
+import hashlib
 from pathlib import Path
-from typing import List, Dict, Tuple, Any, Set, Optional
+from typing import List, Dict, Tuple, Any, Set, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover
+    import numpy as np  # type: ignore
+
+try:
+    import numpy as np
+except ModuleNotFoundError:
+    np = None  # type: ignore
+
+try:
+    import faiss  # type: ignore
+except ModuleNotFoundError:
+    faiss = None  # type: ignore
 
 GRADIO_AVAILABLE = True
 try:
@@ -140,10 +154,59 @@ def _extract_chinese_chars(text: str) -> Set[str]:
     return {ch for ch in (text or "") if "\u4e00" <= ch <= "\u9fff"}
 
 
+class _FallbackIndex:
+    def __init__(self, dim: int, vectors: Optional["np.ndarray"] = None):
+        self.dim = dim
+        if vectors is None:
+            self.vectors = np.zeros((0, dim), dtype=np.float32)
+        else:
+            self.vectors = vectors.astype(np.float32)
+
+    @property
+    def ntotal(self) -> int:
+        return int(self.vectors.shape[0])
+
+    def add(self, vecs: "np.ndarray"):
+        if vecs.size == 0:
+            return
+        if vecs.ndim != 2 or vecs.shape[1] != self.dim:
+            raise ValueError("Vector shape mismatch")
+        self.vectors = np.concatenate([self.vectors, vecs.astype(np.float32)], axis=0)
+
+    def search(self, query: "np.ndarray", top_k: int):
+        if query.ndim != 2 or query.shape[1] != self.dim:
+            raise ValueError("Query shape mismatch")
+        n = query.shape[0]
+        if self.ntotal == 0:
+            distances = np.zeros((n, top_k), dtype=np.float32)
+            indices = -np.ones((n, top_k), dtype=np.int64)
+            return distances, indices
+        sims = query @ self.vectors.T
+        distances = np.zeros((n, top_k), dtype=np.float32)
+        indices = -np.ones((n, top_k), dtype=np.int64)
+        for i in range(n):
+            scores = sims[i]
+            order = np.argsort(-scores)
+            take = order[:top_k]
+            distances[i, : len(take)] = scores[take]
+            indices[i, : len(take)] = take
+        return distances, indices
+
+
 class KeywordMemory:
     def __init__(self, path: Path):
         self.path = path
         self.entries: List[Dict[str, Any]] = []
+        self.vector_dim = 384
+        self._vector_ready = False
+        self._batch_size = 6
+        self.search_threshold = 0.24
+        self._vector_index = None
+        self._vector_meta: List[Dict[str, Any]] = []
+        self._pending: List[Tuple["np.ndarray", Dict[str, Any]]] = [] if np is not None else []
+        self._last_indexed_turn: Dict[str, int] = {}
+        self._last_indexed_summary: Dict[str, int] = {}
+        self._last_super_summary: Dict[str, str] = {}
         self.load()
 
     def load(self):
@@ -171,6 +234,98 @@ class KeywordMemory:
                     "text": text,
                     "chars": entity_chars,
                 })
+        self._init_vector_index()
+
+    def _init_vector_index(self):
+        if np is None:
+            return
+
+        self._vector_meta = []
+        self._pending = []
+        self._vector_ready = False
+        self._last_indexed_turn = {}
+        self._last_indexed_summary = {}
+        self._last_super_summary = {}
+
+        meta_path = self.path.with_suffix(".meta.json")
+        faiss_path = self.path.with_suffix(".faiss")
+        numpy_path = self.path.with_suffix(".npy")
+
+        if meta_path.exists():
+            try:
+                with open(meta_path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, list):
+                        self._vector_meta = data
+            except (json.JSONDecodeError, OSError):
+                self._vector_meta = []
+
+        if faiss is not None:
+            if faiss_path.exists():
+                try:
+                    self._vector_index = faiss.read_index(str(faiss_path))
+                except Exception:
+                    self._vector_index = faiss.IndexFlatIP(self.vector_dim)
+            else:
+                self._vector_index = faiss.IndexFlatIP(self.vector_dim)
+                if numpy_path.exists():
+                    try:
+                        arr = np.load(numpy_path)
+                        if arr.ndim == 2 and arr.shape[1] == self.vector_dim and arr.size:
+                            self._vector_index.add(arr.astype(np.float32))
+                    except Exception:
+                        pass
+        else:
+            existing = None
+            if numpy_path.exists():
+                try:
+                    arr = np.load(numpy_path)
+                    if arr.ndim == 2 and arr.shape[1] == self.vector_dim:
+                        existing = arr.astype(np.float32)
+                except Exception:
+                    existing = None
+            self._vector_index = _FallbackIndex(self.vector_dim, existing)
+
+        if self._vector_index is None:
+            return
+
+        ntotal = getattr(self._vector_index, "ntotal", 0)
+        if callable(ntotal):  # faiss swig can expose as method
+            ntotal = ntotal()
+        if not isinstance(ntotal, int):
+            ntotal = int(ntotal)
+
+        if len(self._vector_meta) > ntotal:
+            self._vector_meta = self._vector_meta[:ntotal]
+        elif len(self._vector_meta) < ntotal:
+            for _ in range(ntotal - len(self._vector_meta)):
+                self._vector_meta.append({})
+
+        self._vector_ready = True
+        self._rebuild_vector_caches()
+
+    def _rebuild_vector_caches(self):
+        self._last_indexed_turn = {}
+        self._last_indexed_summary = {}
+        self._last_super_summary = {}
+        for meta in self._vector_meta:
+            if not isinstance(meta, dict):
+                continue
+            mem_id = str(meta.get("mem_id") or DEFAULT_MEM_ID)
+            if meta.get("type") == "turn":
+                idx = int(meta.get("turn", -1))
+                current = self._last_indexed_turn.get(mem_id, -1)
+                if idx > current:
+                    self._last_indexed_turn[mem_id] = idx
+            elif meta.get("type") == "summary":
+                idx = int(meta.get("summary_idx", -1))
+                current = self._last_indexed_summary.get(mem_id, -1)
+                if idx > current:
+                    self._last_indexed_summary[mem_id] = idx
+            elif meta.get("type") == "super_summary":
+                marker = str(meta.get("hash") or "")
+                if marker:
+                    self._last_super_summary[mem_id] = marker
 
     def match(self, query: str) -> List[Dict[str, Any]]:
         user_chars = _extract_chinese_chars(query)
@@ -181,6 +336,218 @@ class KeywordMemory:
             if len(user_chars & entry["chars"]) >= 2:
                 matches.append(entry)
         return matches
+
+    # === 向量索引功能 ===
+    def _should_index(self, text: str) -> bool:
+        cleaned = (text or "").strip()
+        if len(cleaned) < 12:
+            return False
+        unique = _extract_chinese_chars(cleaned)
+        if len(unique) < 2 and len(cleaned.split()) <= 3:
+            return False
+        return True
+
+    def _shorten(self, text: str, limit: int = 120) -> str:
+        if len(text) <= limit:
+            return text
+        return text[:limit].rstrip() + "…"
+
+    def _tokenize_for_embedding(self, text: str) -> List[str]:
+        lowered = text.lower()
+        words = re.findall(r"[\w一-鿿]{2,12}", lowered)
+        compact = re.sub(r"\s+", "", lowered)
+        ngrams: List[str] = []
+        for size in (2, 3):
+            for i in range(len(compact) - size + 1):
+                ngrams.append(compact[i:i+size])
+        return words + ngrams
+
+    def _embed_text(self, text: str) -> Optional["np.ndarray"]:
+        if np is None or not self._vector_ready:
+            return None
+        content = (text or "").strip()
+        if not content:
+            return None
+        tokens = self._tokenize_for_embedding(content)
+        if not tokens:
+            return None
+        vec = np.zeros(self.vector_dim, dtype=np.float32)
+        for token in tokens:
+            digest = hashlib.md5(token.encode("utf-8")).digest()
+            idx = int.from_bytes(digest[:4], "little") % self.vector_dim
+            vec[idx] += 1.0
+        norm = float(np.linalg.norm(vec))
+        if norm <= 0:
+            return None
+        return vec / norm
+
+    def _queue_fragment(self, vector: "np.ndarray", meta: Dict[str, Any]):
+        if np is None or not self._vector_ready:
+            return
+        self._pending.append((vector.astype(np.float32), meta))
+
+    def queue_memory_fragments(self, mem: Dict[str, Any]):
+        if np is None or not self._vector_ready:
+            return
+        mem_id = str(mem.get("id") or DEFAULT_MEM_ID)
+
+        turns = mem.get("turns") or []
+        last_turn_idx = self._last_indexed_turn.get(mem_id, -1)
+        for idx in range(last_turn_idx + 1, len(turns)):
+            turn = turns[idx]
+            user_text = str(turn.get("u") or "").strip()
+            bot_text = str(turn.get("a") or "").strip()
+            combined = (f"[老师]{user_text}\n[优香]{bot_text}").strip()
+            if not combined or not self._should_index(combined):
+                continue
+            vec = self._embed_text(combined)
+            if vec is None:
+                continue
+            meta = {
+                "type": "turn",
+                "mem_id": mem_id,
+                "turn": idx,
+                "content": combined,
+                "label": self._shorten(combined.replace("\n", " "), 140),
+            }
+            self._queue_fragment(vec, meta)
+            self._last_indexed_turn[mem_id] = idx
+
+        summaries = mem.get("block_summaries") or []
+        last_summary_idx = self._last_indexed_summary.get(mem_id, -1)
+        for idx in range(last_summary_idx + 1, len(summaries)):
+            summary_text = str(summaries[idx].get("summary") or "").strip()
+            if not summary_text or not self._should_index(summary_text):
+                continue
+            vec = self._embed_text(summary_text)
+            if vec is None:
+                continue
+            meta = {
+                "type": "summary",
+                "mem_id": mem_id,
+                "summary_idx": idx,
+                "content": summary_text,
+                "label": self._shorten(summary_text.replace("\n", " "), 160),
+            }
+            self._queue_fragment(vec, meta)
+            self._last_indexed_summary[mem_id] = idx
+
+        super_summary = str(mem.get("super_summary") or "").strip()
+        if super_summary:
+            marker = hashlib.md5(super_summary.encode("utf-8")).hexdigest()
+            if marker != self._last_super_summary.get(mem_id):
+                if self._should_index(super_summary):
+                    vec = self._embed_text(super_summary)
+                    if vec is not None:
+                        meta = {
+                            "type": "super_summary",
+                            "mem_id": mem_id,
+                            "hash": marker,
+                            "content": super_summary,
+                            "label": self._shorten(super_summary.replace("\n", " "), 160),
+                        }
+                        self._queue_fragment(vec, meta)
+                self._last_super_summary[mem_id] = marker
+
+    def flush_pending(self, force: bool = False) -> bool:
+        if np is None or not self._vector_ready or not self._pending:
+            return False
+        if not force and len(self._pending) < self._batch_size:
+            return False
+        vectors = np.stack([item[0] for item in self._pending]).astype(np.float32)
+        metas = [item[1] for item in self._pending]
+        if faiss is not None and isinstance(self._vector_index, faiss.Index):
+            self._vector_index.add(vectors)
+        elif isinstance(self._vector_index, _FallbackIndex):
+            self._vector_index.add(vectors)
+        else:
+            # Unknown index type
+            self._pending.clear()
+            return False
+        self._vector_meta.extend(metas)
+        self._pending.clear()
+        self._persist_vector_store()
+        return True
+
+    def _persist_vector_store(self):
+        if np is None or not self._vector_ready:
+            return
+        meta_path = self.path.with_suffix(".meta.json")
+        faiss_path = self.path.with_suffix(".faiss")
+        numpy_path = self.path.with_suffix(".npy")
+        try:
+            with open(meta_path, "w", encoding="utf-8") as fh:
+                json.dump(self._vector_meta, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+        if faiss is not None and isinstance(self._vector_index, faiss.Index):
+            try:
+                faiss.write_index(self._vector_index, str(faiss_path))
+                if numpy_path.exists():
+                    numpy_path.unlink()
+            except Exception:
+                pass
+        elif isinstance(self._vector_index, _FallbackIndex):
+            try:
+                np.save(numpy_path, self._vector_index.vectors.astype(np.float32))
+                if faiss_path.exists():
+                    faiss_path.unlink()
+            except Exception:
+                pass
+
+    def mark_dialogue_end(self):
+        self.flush_pending(force=True)
+
+    def _search_index(self, query: "np.ndarray", top_k: int):
+        if faiss is not None and isinstance(self._vector_index, faiss.Index):
+            return self._vector_index.search(query, top_k)
+        if isinstance(self._vector_index, _FallbackIndex):
+            return self._vector_index.search(query, top_k)
+        return np.zeros((1, top_k), dtype=np.float32), -np.ones((1, top_k), dtype=np.int64)
+
+    def search_similar_fragments(self, text: str, top_k: int = 3, min_score: Optional[float] = None) -> List[Dict[str, Any]]:
+        if np is None or not self._vector_ready:
+            return []
+        vec = self._embed_text(text)
+        if vec is None:
+            return []
+        threshold = self.search_threshold if min_score is None else float(min_score)
+        query = vec[np.newaxis, :]
+        distances, indices = self._search_index(query, max(top_k * 2, top_k))
+        results: List[Tuple[float, Dict[str, Any]]] = []
+        if indices.size:
+            for score, idx in zip(distances[0], indices[0]):
+                if idx < 0 or idx >= len(self._vector_meta):
+                    continue
+                meta = self._vector_meta[idx]
+                if not isinstance(meta, dict):
+                    continue
+                results.append((float(score), meta))
+
+        if self._pending:
+            pending_vecs = np.stack([item[0] for item in self._pending])
+            pending_scores = pending_vecs @ vec
+            for score, item in zip(pending_scores, self._pending):
+                meta = item[1]
+                results.append((float(score), meta))
+
+        results.sort(key=lambda pair: pair[0], reverse=True)
+        filtered: List[Dict[str, Any]] = []
+        seen_labels: Set[str] = set()
+        for score, meta in results:
+            if score < threshold:
+                continue
+            label = str(meta.get("label") or meta.get("content") or "")
+            if not label or label in seen_labels:
+                continue
+            seen_labels.add(label)
+            enriched = dict(meta)
+            enriched["score"] = score
+            filtered.append(enriched)
+            if len(filtered) >= top_k:
+                break
+        return filtered
 
 
 def new_dynamic_state() -> Dict[str, Any]:
@@ -1161,6 +1528,11 @@ def _init_gradio_app():
         def do_save_mem(mem_obj, mem_id_text):
             mem_obj["id"] = mem_id_text or DEFAULT_MEM_ID
             save_memory(mem_obj)
+            try:
+                keyword_memory.queue_memory_fragments(mem_obj)
+                keyword_memory.mark_dialogue_end()
+            except Exception:
+                pass
             export_path = export_long_term_memory()
             if export_path:
                 gr.Info(f"已保存记忆：{mem_obj['id']}；长期记忆可下载")
@@ -1173,6 +1545,10 @@ def _init_gradio_app():
             m = new_memory(mem_id_text or DEFAULT_MEM_ID)
             save_memory(m)
             clear_long_term_memory()
+            try:
+                keyword_memory.mark_dialogue_end()
+            except Exception:
+                pass
             gr.Info("记忆、长期记忆与对话已清空")
             return m, [], [{"role": "system", "content": "(hidden)"}], new_dynamic_state(), None
         btn_clear_mem.click(do_clear_mem, inputs=[mem_id], outputs=[state_mem, chat, state_msgs, state_dynamic, mem_export])
@@ -1202,6 +1578,21 @@ def _init_gradio_app():
 
             dyn_state, keyword_texts = advance_dynamic_state(dyn_state, user_input, keyword_memory, bool(use_rag_flag))
             keywords_for_prompt = list(keyword_texts)
+            vector_snippets: List[str] = []
+            if bool(use_rag_flag) and hasattr(keyword_memory, "search_similar_fragments"):
+                try:
+                    hits = keyword_memory.search_similar_fragments(user_input, top_k=3)
+                except Exception:
+                    hits = []
+                for hit in hits:
+                    label = str(hit.get("label") or hit.get("content") or "").strip()
+                    if not label:
+                        continue
+                    snippet = f"【回顾】{label}"
+                    if snippet not in keywords_for_prompt and snippet not in vector_snippets:
+                        vector_snippets.append(snippet)
+            if vector_snippets:
+                keywords_for_prompt.extend(vector_snippets)
             if any(kw in user_input for kw in ACCOUNTING_KEYWORDS):
                 keywords_for_prompt = [ACCOUNTING_ALERT] + keywords_for_prompt
 
@@ -1291,7 +1682,17 @@ def _init_gradio_app():
             if mem_en_flag:
                 mem_obj["turns"].append({"u": user_input, "a": reply})
                 refresh_memory_layers(mem_obj)
+                try:
+                    keyword_memory.queue_memory_fragments(mem_obj)
+                    keyword_memory.flush_pending(force=False)
+                except Exception:
+                    pass
                 save_memory(mem_obj)
+            else:
+                try:
+                    keyword_memory.flush_pending(force=True)
+                except Exception:
+                    pass
 
             return ui_hist, msg_hist, mem_obj, dyn_state
 
