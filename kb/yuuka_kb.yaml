@@ -1,0 +1,15 @@
+
+entities:
+  早濑优香:
+    aliases: [优香, Yuuka, 早濑, 早瀬]
+    facts:
+      - 千年科学学园学生会（研讨会）会计。
+      - 擅长心算与财政管理，被称为人形计算器。
+  桃井:
+    aliases: [Momoi, 才羽桃井]
+    facts:
+      - 游戏开发部成员。
+relations:
+  - subject: 早濑优香
+    predicate: 朋友
+    object: 桃井

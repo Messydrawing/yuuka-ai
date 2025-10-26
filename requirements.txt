@@ -1,0 +1,7 @@
+transformers>=4.37.0
+torch>=1.13.0
+accelerate
+peft
+bitsandbytes
+datasets
+safetensors

@@ -1,0 +1,7 @@
+data/*.jsonl
+!data/yuuka_dialogues_zh.jsonl.example
+models/
+outputs/
+runs/
+__pycache__/
+*.log
