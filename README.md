@@ -1,6 +1,6 @@
 # Yuuka AI Fine-tuning Toolkit
 
-
+![效果图](yuuka-ai.jpg)
 
 ## 训练
 
