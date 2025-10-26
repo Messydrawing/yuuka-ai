@@ -28,6 +28,7 @@ python train_lora.py \
 
 ## 使用
 
+如果你没有进行训练直接准备使用，请先运行脚本`download_lora.py`将微调参数下载到本地目录./models中
 ```bash
  python yuuka_runtime.py  --base models/Qwen2.5-7B-Instruct --lora models/yuuka_qwen_lora11 --persona memory/persona_yuuka.txt 
 ```
